@@ -7,8 +7,9 @@ It's meant for consoles kept away from Sony's servers (blocked at DNS), whose
 clock drifts because it never syncs. It does not contact Sony.
 
 There's also a second payload, **`time-unsync.elf`**. It sets the clock *back*
-to a fixed date, so that payloads which expire after a certain date (such as
-the etaHEN beta builds that some firmwares need) can still start. See
+so that etaHEN beta builds, which refuse to start after their expiry date,
+still run. It finds your etaHEN payload, reads the expiry date built into it
+and sets the clock to just before that date. See
 [Expired etaHEN beta / autoload lists](#expired-etahen-beta--autoload-lists).
 
 ## What it does
@@ -23,6 +24,13 @@ the etaHEN beta builds that some firmwares need) can still start. See
    `time-sync: FAILED: <reason>`.
 
 The console's own time zone setting still decides the local time shown.
+
+**It takes a couple of seconds.** From pressing "run" (or the payload being
+started by an autoloader) to the clock being set and the notification
+appearing, expect roughly 2–3 seconds. Most of that is the loader starting the
+payload and the PS5 showing the notification, not the time lookup itself. If a
+server doesn't answer, time-sync waits `timeout` seconds (2 by default) before
+trying the next one.
 
 ## Getting the .elf (no PC needed)
 
@@ -58,31 +66,90 @@ loader port, then pick `time-sync.elf`.
 
 ## Expired etaHEN beta / autoload lists
 
-Some firmwares are only supported by a **beta** build of etaHEN, and beta
-builds stop working after a certain date. To keep using one, the clock has
-to be set back before etaHEN starts, and corrected again afterwards.
+Some firmwares are only supported by a **beta** (test) build of etaHEN, and
+beta builds stop working after a date built into them. When that date has
+passed, etaHEN shows *"This etaHEN Beta version expired on …"* and doesn't
+start. Full releases (like 2.5B from GitHub) never expire.
 
-**Run the payloads in this exact order, for example in your autoload list:**
+The check only looks at the console clock when etaHEN starts, so the fix is
+to set the clock back before etaHEN starts and put it right again afterwards.
 
-1. **`time-unsync.elf`**: sets the clock back to `unsync_date`.
-2. **The etaHEN beta**: starts because the console thinks it's still before
-   the expiry date.
-3. **`time-sync.elf`**: sets the clock back to the real time from the
-   internet.
+**Run the payloads in this order, for example in your autoload list:**
 
-Before you start, set `unsync_date` in `config.ini` to a date when your
-etaHEN beta was still valid, for example the day it was released.
+1. **`time-unsync.elf`**: moves the clock to before the beta's expiry date.
+2. *Wait about 3 seconds.*
+3. **The etaHEN beta**: starts, because the console thinks it's before the
+   expiry date.
+4. **`time-sync.elf`**: waits until etaHEN has started (up to `etahen_wait`
+   seconds, 60 by default), then sets the real time from the internet.
 
-Things to know:
+For the common autoloaders ([ps5-y2jb-autoloader] and
+[ps5-unified-autoloader]), `autoload.txt` would look like this. `!3000` waits
+3000 ms:
+
+```
+time-unsync.elf
+!3000
+etaHEN.elf
+time-sync.elf
+```
+
+If your loader has no wait command, send the payloads by hand in this order
+and wait for each notification before sending the next.
+
+[ps5-y2jb-autoloader]: https://github.com/itsPLK/ps5-y2jb-autoloader
+[ps5-unified-autoloader]: https://github.com/itsPLK/ps5-unified-autoloader
+
+### How time-unsync picks the date
+
+With the default `unsync_mode = auto`, time-unsync looks for etaHEN payload
+files (`.elf` or `.bin`, any file name) in these places, in this order:
+
+1. Anything listed in `etahen_path` in `config.ini`.
+2. Autoloader folders: `ps5_autoloader` and `ps5_autoloader_<TITLE_ID>` on
+   USB drives (`/mnt/usb0`–`/mnt/usb7`), then in `/data`.
+3. Payload Manager folders: `pldmgr` and `pldmgr/payloads` on USB drives,
+   then `/data/pldmgr` and `/data/pldmgr/payloads`.
+4. `/data/etaHEN`, the top level of `/data`, and the top level of each USB
+   drive.
+
+It reads each file without running it. etaHEN payloads carry their real code
+LZMA-compressed inside; time-unsync unpacks the first part and looks for the
+built-in expiry check, which contains the date. Then:
+
+| What it finds | What it does |
+|---|---|
+| An etaHEN **beta** | Sets the clock to **2 days before** its expiry date (the margin covers time zones). If several betas are found, it uses the earliest date. If the clock is already earlier than that, it leaves it alone. |
+| Only etaHEN **full releases** | Leaves the clock alone, because they never expire. |
+| No etaHEN at all | Falls back to `unsync_date` (2025-01-01 by default). |
+
+The notification says which of these happened, for example
+`time-unsync: clock set to 2026-09-29 (etaHEN beta expires 2026-10-01)`.
+
+Tested against every etaHEN build available to us: the public 1.7B–2.5B
+releases (no expiry found), a 2.4B file that GitHub later replaced with one
+expiring 2025-12-25 (found), and the 2.6b test build for firmware up to 12.70
+(found: 2026-10-01). A future etaHEN that stores its date differently
+wouldn't be recognised; it would be treated as having no expiry, or as no
+etaHEN at all (`unsync_date`). If that happens, set `unsync_mode = fixed`
+and choose `unsync_date` yourself.
+
+### Things to know
 
 - **Always run `time-sync.elf` last.** The clock change made by
   `time-unsync.elf` survives a reboot too. Until time-sync runs, the console
   stays on the old date.
+- **time-sync only waits after time-unsync.** time-unsync leaves a marker
+  file (`/data/timesyncer/unsynced`). time-sync waits for etaHEN only when
+  the marker is there, and deletes it after a successful sync. etaHEN counts
+  as started once its service socket (`/system_tmp/etaHEN_crit_service`)
+  exists. If it never appears, time-sync syncs anyway after `etahen_wait`
+  seconds.
 - **Wait for the network.** In an autoload list, time-sync can start before
   the network is up. It keeps retrying for `retry_for` seconds (30 by
   default). If it still fails in your setup, raise `retry_for`.
-- If time-sync can't reach any server at all, the clock stays on
-  `unsync_date`. Fix the network or `servers` setting, then run it again.
+- If time-sync can't reach any server at all, the clock stays set back. Fix
+  the network or `servers` setting, then run it again.
 
 ## Configuration: `/data/timesyncer/config.ini`
 
@@ -96,14 +163,22 @@ servers = time.apple.com, time.cloudflare.com, pool.ntp.org
 ; UDP port of the NTP server.
 port = 123
 ; Seconds to wait for each server before trying the next.
-timeout = 5
+timeout = 2
 ; time-sync keeps retrying for this many seconds if no server answers.
 retry_for = 30
 ; On-screen notifications: all, errors, off
 notify = all
+; Check GitHub (at most once a day) for a newer release: on, off
+update_check = on
+; After time-unsync, wait up to this many seconds for etaHEN to start
+etahen_wait = 60
 
 [unsync]
-; Date time-unsync.elf sets the clock to, in UTC:
+; auto: read the expiry date from your etaHEN payload; fixed: use unsync_date
+unsync_mode = auto
+; Extra files or folders to check for etaHEN first, separated by commas
+etahen_path =
+; Date for fixed mode, or when auto finds no etaHEN. UTC:
 ; YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
 unsync_date = 2025-01-01 00:00:00
 ```
@@ -118,15 +193,42 @@ are ignored, and the defaults are used for them.
 You can also change the built-in default servers at build time:
 `make NTP_SERVER="192.168.1.1"`.
 
+## Update notifications
+
+After a successful sync, `time-sync.elf` asks GitHub for the newest release
+of this project. If there's a newer version than the one you're running,
+the PS5 shows a notification like:
+
+```
+time-sync: update v1.3 available (you have v1.2) - github.com/uzergit/ps5-time-sync/releases
+```
+
+- It checks **at most once a day** (the time of the last check is saved in
+  `/data/timesyncer/last_update_check`). If the check fails, for example
+  because GitHub is unreachable, it tries again on the next run.
+- It only runs **after** the clock has been set, because HTTPS needs a
+  correct clock. `time-unsync.elf` never checks.
+- It uses the PS5's own HTTPS libraries and only talks to `api.github.com`.
+  If those libraries can't be loaded, the check is skipped and the time sync
+  still works.
+- It doesn't download or install anything: you update by grabbing the new
+  `.elf` from the Releases page.
+- Turn it off with `update_check = off` in `config.ini`.
+
+Builds made outside a release (version `dev`) never check.
+
 ## Building locally
 
 ```sh
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-make
+make                  # version "dev", update check disabled
+make VERSION=v1.2     # what the release workflow does
 ```
 
 This needs [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) and
-clang/lld 18.
+clang/lld 18. `lzma/` holds the LZMA decoder from the
+[LZMA SDK](https://www.7-zip.org/sdk.html) by Igor Pavlov (public domain),
+which time-unsync uses to read etaHEN payloads.
 
 ## Does the time stick after a reboot?
 

@@ -43,6 +43,10 @@ jobs:
           test -f "$PS5_PAYLOAD_SDK/toolchain/prospero.mk"
 
       - name: Build
+        env:
+          # Built into the payload for the update check; "dev" disables it.
+          VERSION: ${{ inputs.release || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'dev' }}
+          UPDATE_REPO: ${{ github.repository }}
         run: make
 
       - uses: actions/upload-artifact@v4
