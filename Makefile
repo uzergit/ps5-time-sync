@@ -8,6 +8,7 @@ else
 endif
 
 ELF := time-sync.elf
+UNSYNC_ELF := time-unsync.elf
 
 CFLAGS := -Wall -Werror -O2
 # Override the default server at build time, e.g.:
@@ -16,13 +17,16 @@ ifdef NTP_SERVER
 CFLAGS += -DNTP_SERVER=\"$(NTP_SERVER)\"
 endif
 
-all: $(ELF)
+all: $(ELF) $(UNSYNC_ELF)
 
 $(ELF): main.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(UNSYNC_ELF): main.c
+	$(CC) $(CFLAGS) -DUNSYNC -o $@ $^
+
 clean:
-	rm -f $(ELF)
+	rm -f $(ELF) $(UNSYNC_ELF)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
