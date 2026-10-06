@@ -2,6 +2,11 @@ name: build-elf
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to publish (e.g. v1.0). Leave empty to only build."
+        required: false
+        default: ""
   push:
     branches: [main]
     tags: ["v*"]
@@ -49,7 +54,7 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -60,6 +65,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # From "Run workflow", create the tag on the commit just built.
+          tag_name: ${{ inputs.release || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: |
             time-sync.elf
             config.ini

@@ -31,9 +31,10 @@ download one of those builds:
 3. Under **Artifacts**, download **time-sync**. It's a zip containing
    `time-sync.elf` and an example `config.ini`.
 
-To publish a new release, push a tag that starts with `v` (for example
-`v1.1`). The workflow builds the payload and creates a Release with
-`time-sync.elf` and `config.ini` attached.
+To publish a new release from your phone, go to **Actions → build-elf → Run
+workflow**, type a version such as `v1.1` in the "Release tag" box and run it.
+The workflow builds the payload and creates a Release with `time-sync.elf`
+and `config.ini` attached. Pushing a tag that starts with `v` does the same.
 
 ## Sending it to the PS5
 
