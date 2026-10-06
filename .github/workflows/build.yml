@@ -1,0 +1,45 @@
+name: build-elf
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+  # Commit of github.com/ps5-payload-dev/sdk used if the release zip
+  # cannot be downloaded (releases are published as pre-releases, which
+  # GitHub's "latest/download" URL may not resolve).
+  SDK_FALLBACK_REF: f7fd02e6e195902a449b5e664917be8c01888b34
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bash wget unzip make clang-18 lld-18 llvm-18
+
+      - name: Install ps5-payload-sdk
+        run: |
+          if wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip; then
+            # The zip contains a top-level ps5-payload-sdk/ directory.
+            sudo unzip -q -d /opt ps5-payload-sdk.zip
+          else
+            echo "Release zip unavailable, building SDK from source"
+            git clone https://github.com/ps5-payload-dev/sdk.git /tmp/sdk-src
+            git -C /tmp/sdk-src checkout "$SDK_FALLBACK_REF"
+            sudo make -C /tmp/sdk-src DESTDIR="$PS5_PAYLOAD_SDK" install
+          fi
+          test -f "$PS5_PAYLOAD_SDK/toolchain/prospero.mk"
+
+      - name: Build
+        run: make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: time-sync
+          path: time-sync.elf
