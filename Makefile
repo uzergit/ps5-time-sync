@@ -10,7 +10,11 @@ endif
 ELF := time-sync.elf
 UNSYNC_ELF := time-unsync.elf
 
+VERSION ?= dev
+UPDATE_REPO ?= uzergit/ps5-time-sync
+
 CFLAGS := -Wall -Werror -O2
+CFLAGS += -DVERSION=\"$(VERSION)\" -DUPDATE_REPO=\"$(UPDATE_REPO)\"
 # Override the default server at build time, e.g.:
 #   make NTP_SERVER=192.168.1.1
 ifdef NTP_SERVER

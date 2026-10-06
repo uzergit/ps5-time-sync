@@ -17,6 +17,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dlfcn.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -30,12 +31,23 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef VERSION
+#define VERSION "dev"
+#endif
+
+#ifndef UPDATE_REPO
+#define UPDATE_REPO "uzergit/ps5-time-sync"
+#endif
+
 #ifndef NTP_SERVER
 #define NTP_SERVER "time.apple.com, time.cloudflare.com, pool.ntp.org"
 #endif
 
 #define CONF_DIR        "/data/timesyncer"
 #define CONF_PATH       CONF_DIR "/config.ini"
+#define STAMP_PATH      CONF_DIR "/last_update_check"
+#define UPDATE_INTERVAL (24 * 60 * 60)
+#define UPDATE_TIMEOUT_US (5 * 1000000U)
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
@@ -54,6 +66,7 @@ typedef struct {
   int notify;        /* 0 = off, 1 = errors only, 2 = all */
   int retry_for;     /* keep retrying for this many seconds (sync) */
   char unsync_date[32]; /* "YYYY-MM-DD[ HH:MM[:SS]]" UTC (unsync) */
+  int update_check;  /* look for a newer release on GitHub (sync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -66,9 +79,10 @@ int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
 static config_t cfg = {.servers = NTP_SERVER,
                        .port = 123,
-                       .timeout = 5,
+                       .timeout = 2,
                        .notify = 2,
                        .retry_for = 30,
+                       .update_check = 1,
                        .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
@@ -84,7 +98,7 @@ static const char default_ini[] =
     "port = 123\n"
     "\n"
     "; Seconds to wait for each server before trying the next.\n"
-    "timeout = 5\n"
+    "timeout = 2\n"
     "\n"
     "; time-sync keeps retrying for this many seconds if no server\n"
     "; answers, e.g. while the network is still coming up at boot.\n"
@@ -92,6 +106,10 @@ static const char default_ini[] =
     "\n"
     "; On-screen notifications: all, errors, off\n"
     "notify = all\n"
+    "\n"
+    "; After syncing, check GitHub (at most once a day) for a newer\n"
+    "; release and show a notification if there is one: on, off\n"
+    "update_check = on\n"
     "\n"
     "[unsync]\n"
     "; Date time-unsync.elf sets the clock to, in UTC:\n"
@@ -175,6 +193,9 @@ static void load_config(void) {
       if (*v) snprintf(cfg.servers, sizeof(cfg.servers), "%s", v);
     } else if (!strcasecmp(k, "port")) {
       cfg.port = parse_int(v, 1, 65535, cfg.port);
+    } else if (!strcasecmp(k, "update_check")) {
+      if (!strcasecmp(v, "off") || !strcmp(v, "0")) cfg.update_check = 0;
+      else if (!strcasecmp(v, "on") || !strcmp(v, "1")) cfg.update_check = 1;
     } else if (!strcasecmp(k, "retry_for")) {
       cfg.retry_for = parse_int(v, 0, 600, cfg.retry_for);
     } else if (!strcasecmp(k, "unsync_date")) {
@@ -373,6 +394,174 @@ static const char *try_servers(char *list, size_t len, struct timeval *set,
   return NULL;
 }
 
+/* Parse "v1.2.3" (the 'v' is optional) into up to three numbers. */
+static int parse_version(const char *s, int v[3]) {
+  int n;
+  v[0] = v[1] = v[2] = 0;
+  if (*s == 'v' || *s == 'V') s++;
+  n = sscanf(s, "%d.%d.%d", &v[0], &v[1], &v[2]);
+  return n >= 1 ? 0 : -1;
+}
+
+static int version_newer(const char *latest, const char *current) {
+  int a[3], b[3];
+  if (parse_version(latest, a) || parse_version(current, b)) return 0;
+  for (int i = 0; i < 3; i++)
+    if (a[i] != b[i]) return a[i] > b[i];
+  return 0;
+}
+
+/* Returns 1 if the last check was less than UPDATE_INTERVAL ago. */
+static int checked_recently(time_t now) {
+  long long last = 0;
+  FILE *f = fopen(STAMP_PATH, "r");
+  if (f) {
+    if (fscanf(f, "%lld", &last) != 1) last = 0;
+    fclose(f);
+  }
+  return last > 0 && now >= last && now - last < UPDATE_INTERVAL;
+}
+
+static void stamp_check(time_t now) {
+  FILE *f = fopen(STAMP_PATH, "w");
+  if (f) {
+    fprintf(f, "%lld\n", (long long)now);
+    fclose(f);
+  }
+}
+
+/* Fetch the latest release tag over HTTPS with the system's own network
+ * libraries. They are loaded at run time, so a console where they are
+ * unavailable just skips the check instead of failing to load the ELF. */
+static int fetch_latest_tag(char *tag, size_t len) {
+  int (*NetInit)(void);
+  int (*NetPoolCreate)(const char *, int, int);
+  int (*NetPoolDestroy)(int);
+  int (*SslInit)(size_t);
+  int (*SslTerm)(int);
+  int (*H2Init)(int, int, size_t, int);
+  int (*H2Term)(int);
+  int (*H2CreateTemplate)(int, const char *, int, int);
+  int (*H2DeleteTemplate)(int);
+  int (*H2CreateRequestWithURL)(int, const char *, const char *, uint64_t);
+  int (*H2DeleteRequest)(int);
+  int (*H2AddRequestHeader)(int, const char *, const char *, int);
+  int (*H2SetResolveTimeOut)(int, uint32_t);
+  int (*H2SetConnectTimeOut)(int, uint32_t);
+  int (*H2SetRecvTimeOut)(int, uint32_t);
+  int (*H2SendRequest)(int, const void *, size_t);
+  int (*H2GetStatusCode)(int, int *);
+  int (*H2ReadData)(int, void *, size_t);
+  void *net, *ssl, *http;
+  int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, req = -1, status = 0;
+  int rc = -1;
+  static char body[32 * 1024];
+  size_t got = 0;
+
+  net = dlopen("libSceNet.sprx", RTLD_LAZY);
+  ssl = dlopen("libSceSsl.sprx", RTLD_LAZY);
+  http = dlopen("libSceHttp2.sprx", RTLD_LAZY);
+  if (!net || !ssl || !http) {
+    printf("[" TAG "] update check: cannot load network libraries\n");
+    goto out;
+  }
+
+#define SYM(var, lib, name) \
+  if (!(*(void **)&var = dlsym(lib, name))) goto out
+  SYM(NetInit, net, "sceNetInit");
+  SYM(NetPoolCreate, net, "sceNetPoolCreate");
+  SYM(NetPoolDestroy, net, "sceNetPoolDestroy");
+  SYM(SslInit, ssl, "sceSslInit");
+  SYM(SslTerm, ssl, "sceSslTerm");
+  SYM(H2Init, http, "sceHttp2Init");
+  SYM(H2Term, http, "sceHttp2Term");
+  SYM(H2CreateTemplate, http, "sceHttp2CreateTemplate");
+  SYM(H2DeleteTemplate, http, "sceHttp2DeleteTemplate");
+  SYM(H2CreateRequestWithURL, http, "sceHttp2CreateRequestWithURL");
+  SYM(H2DeleteRequest, http, "sceHttp2DeleteRequest");
+  SYM(H2AddRequestHeader, http, "sceHttp2AddRequestHeader");
+  SYM(H2SetResolveTimeOut, http, "sceHttp2SetResolveTimeOut");
+  SYM(H2SetConnectTimeOut, http, "sceHttp2SetConnectTimeOut");
+  SYM(H2SetRecvTimeOut, http, "sceHttp2SetRecvTimeOut");
+  SYM(H2SendRequest, http, "sceHttp2SendRequest");
+  SYM(H2GetStatusCode, http, "sceHttp2GetStatusCode");
+  SYM(H2ReadData, http, "sceHttp2ReadData");
+#undef SYM
+
+  NetInit();
+  if ((pool = NetPoolCreate(TAG, 32 * 1024, 0)) < 0) goto out;
+  if ((sslctx = SslInit(256 * 1024)) < 0) goto out;
+  if ((ctx = H2Init(pool, sslctx, 256 * 1024, 1)) < 0) goto out;
+  if ((tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1)) < 0) goto out;
+  if ((req = H2CreateRequestWithURL(
+           tmpl, "GET",
+           "https://api.github.com/repos/" UPDATE_REPO "/releases/latest",
+           0)) < 0)
+    goto out;
+  H2AddRequestHeader(req, "Accept", "application/vnd.github+json", 0);
+  H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US);
+  H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US);
+  H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US);
+
+  if (H2SendRequest(req, NULL, 0) || H2GetStatusCode(req, &status)) {
+    printf("[" TAG "] update check: request failed\n");
+    goto out;
+  }
+  if (status != 200) {
+    printf("[" TAG "] update check: HTTP %d\n", status);
+    goto out;
+  }
+  for (;;) {
+    int n = H2ReadData(req, body + got, sizeof(body) - 1 - got);
+    if (n <= 0) break;
+    got += n;
+    if (got >= sizeof(body) - 1) break;
+  }
+  body[got] = 0;
+
+  /* Minimal JSON lookup: "tag_name": "v1.2" */
+  char *p = strstr(body, "\"tag_name\"");
+  if (p && (p = strchr(p + 10, ':')) && (p = strchr(p, '"'))) {
+    size_t i = 0;
+    for (p++; *p && *p != '"' && i + 1 < len; p++) tag[i++] = *p;
+    tag[i] = 0;
+    rc = i ? 0 : -1;
+  }
+
+out:
+  if (req >= 0) H2DeleteRequest(req);
+  if (tmpl >= 0) H2DeleteTemplate(tmpl);
+  if (ctx >= 0) H2Term(ctx);
+  if (sslctx >= 0) SslTerm(sslctx);
+  if (pool >= 0) NetPoolDestroy(pool);
+  if (http) dlclose(http);
+  if (ssl) dlclose(ssl);
+  if (net) dlclose(net);
+  return rc;
+}
+
+static void check_for_update(void) {
+  char latest[64];
+  time_t now = time(NULL);
+
+  if (!cfg.update_check || !strcmp(VERSION, "dev") || checked_recently(now))
+    return;
+  if (fetch_latest_tag(latest, sizeof(latest)) != 0)
+    return; /* try again on the next run */
+  stamp_check(now);
+
+  printf("[" TAG "] running " VERSION ", latest is %s\n", latest);
+  if (version_newer(latest, VERSION) && cfg.notify) {
+    notify_request_t req;
+    memset(&req, 0, sizeof(req));
+    snprintf(req.message, sizeof(req.message),
+             TAG ": update %s available (you have " VERSION
+                 ") - github.com/" UPDATE_REPO "/releases",
+             latest);
+    sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+  }
+}
+
 static int sync_main(void) {
   char list[sizeof(cfg.servers)], suffix[160];
   struct timeval set;
@@ -402,6 +591,9 @@ static int sync_main(void) {
   snprintf(suffix, sizeof(suffix), " via %s (rtt %lld ms)", used,
            (long long)(rtt / 1000));
   report_clock(suffix);
+
+  /* Only after the clock is right: HTTPS certificates need it. */
+  check_for_update();
   return 0;
 }
 

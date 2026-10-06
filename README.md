@@ -24,6 +24,13 @@ the etaHEN beta builds that some firmwares need) can still start. See
 
 The console's own time zone setting still decides the local time shown.
 
+**It takes a couple of seconds.** From pressing "run" (or the payload being
+started by an autoloader) to the clock being set and the notification
+appearing, expect roughly 2–3 seconds. Most of that is the loader starting the
+payload and the PS5 showing the notification, not the time lookup itself. If a
+server doesn't answer, time-sync waits `timeout` seconds (2 by default) before
+trying the next one.
+
 ## Getting the .elf (no PC needed)
 
 The easiest way: open the repo's **Releases** page and download
@@ -65,10 +72,21 @@ to be set back before etaHEN starts, and corrected again afterwards.
 **Run the payloads in this exact order, for example in your autoload list:**
 
 1. **`time-unsync.elf`**: sets the clock back to `unsync_date`.
-2. **The etaHEN beta**: starts because the console thinks it's still before
+2. *Wait a few seconds* (see below).
+3. **The etaHEN beta**: starts because the console thinks it's still before
    the expiry date.
-3. **`time-sync.elf`**: sets the clock back to the real time from the
+4. *Wait a few seconds.*
+5. **`time-sync.elf`**: sets the clock back to the real time from the
    internet.
+
+**Add a delay of about 3–5 seconds between the payloads.** Each one takes a
+couple of seconds to actually change the clock. If the next payload starts
+too early, the etaHEN beta may still see the real date, or etaHEN may still
+be starting up when time-sync runs. Many autoloaders support a wait or sleep
+line for this; check your autoloader's documentation for the exact syntax
+(for example, some use a line like `!3000` to wait 3000 ms). If yours has
+none, start the payloads by hand in this order and wait for each
+notification before sending the next.
 
 Before you start, set `unsync_date` in `config.ini` to a date when your
 etaHEN beta was still valid, for example the day it was released.
@@ -96,11 +114,13 @@ servers = time.apple.com, time.cloudflare.com, pool.ntp.org
 ; UDP port of the NTP server.
 port = 123
 ; Seconds to wait for each server before trying the next.
-timeout = 5
+timeout = 2
 ; time-sync keeps retrying for this many seconds if no server answers.
 retry_for = 30
 ; On-screen notifications: all, errors, off
 notify = all
+; Check GitHub (at most once a day) for a newer release: on, off
+update_check = on
 
 [unsync]
 ; Date time-unsync.elf sets the clock to, in UTC:
@@ -118,11 +138,36 @@ are ignored, and the defaults are used for them.
 You can also change the built-in default servers at build time:
 `make NTP_SERVER="192.168.1.1"`.
 
+## Update notifications
+
+After a successful sync, `time-sync.elf` asks GitHub for the newest release
+of this project. If there's a newer version than the one you're running,
+the PS5 shows a notification like:
+
+```
+time-sync: update v1.3 available (you have v1.2) - github.com/uzergit/ps5-time-sync/releases
+```
+
+- It checks **at most once a day** (the time of the last check is saved in
+  `/data/timesyncer/last_update_check`). If the check fails, for example
+  because GitHub is unreachable, it tries again on the next run.
+- It only runs **after** the clock has been set, because HTTPS needs a
+  correct clock. `time-unsync.elf` never checks.
+- It uses the PS5's own HTTPS libraries and only talks to `api.github.com`.
+  If those libraries can't be loaded, the check is skipped and the time sync
+  still works.
+- It doesn't download or install anything: you update by grabbing the new
+  `.elf` from the Releases page.
+- Turn it off with `update_check = off` in `config.ini`.
+
+Builds made outside a release (version `dev`) never check.
+
 ## Building locally
 
 ```sh
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-make
+make                  # version "dev", update check disabled
+make VERSION=v1.2     # what the release workflow does
 ```
 
 This needs [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) and
