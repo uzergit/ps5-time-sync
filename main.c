@@ -7,6 +7,10 @@
  * confirmed to survive a reboot on a real PS5. The payload reads the clock back
  * and reports what the kernel actually accepted.
  *
+ * Built with -DUNSYNC it becomes time-unsync.elf instead, which sets the
+ * clock back to a fixed date (unsync_date) so that time-limited payloads,
+ * such as etaHEN beta builds, can start. Run time-sync.elf afterwards.
+ *
  * Settings are read from /data/timesyncer/config.ini, which is created
  * with defaults on first run if it does not exist.
  */
@@ -35,12 +39,21 @@
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
+#define RETRY_PAUSE_SEC 3
+
+#ifdef UNSYNC
+#define TAG "time-unsync"
+#else
+#define TAG "time-sync"
+#endif
 
 typedef struct {
   char servers[512]; /* comma-separated, tried in order */
   int port;
   int timeout;       /* seconds per server */
   int notify;        /* 0 = off, 1 = errors only, 2 = all */
+  int retry_for;     /* keep retrying for this many seconds (sync) */
+  char unsync_date[32]; /* "YYYY-MM-DD[ HH:MM[:SS]]" UTC (unsync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -51,8 +64,12 @@ typedef struct {
 
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
-static config_t cfg = {
-    .servers = NTP_SERVER, .port = 123, .timeout = 5, .notify = 2};
+static config_t cfg = {.servers = NTP_SERVER,
+                       .port = 123,
+                       .timeout = 5,
+                       .notify = 2,
+                       .retry_for = 30,
+                       .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
     "; time-sync payload settings\n"
@@ -69,21 +86,31 @@ static const char default_ini[] =
     "; Seconds to wait for each server before trying the next.\n"
     "timeout = 5\n"
     "\n"
+    "; time-sync keeps retrying for this many seconds if no server\n"
+    "; answers, e.g. while the network is still coming up at boot.\n"
+    "retry_for = 30\n"
+    "\n"
     "; On-screen notifications: all, errors, off\n"
-    "notify = all\n";
+    "notify = all\n"
+    "\n"
+    "[unsync]\n"
+    "; Date time-unsync.elf sets the clock to, in UTC:\n"
+    "; YYYY-MM-DD or YYYY-MM-DD HH:MM:SS. Pick a date when your\n"
+    "; time-limited payload (e.g. an etaHEN beta) was still valid.\n"
+    "unsync_date = 2025-01-01 00:00:00\n";
 
 static void vsay(int is_error, const char *fmt, va_list ap) {
   char buf[256];
   notify_request_t req;
 
   vsnprintf(buf, sizeof(buf), fmt, ap);
-  printf("[time-sync] %s\n", buf);
+  printf("[" TAG "] %s\n", buf);
   fflush(stdout);
 
   if (cfg.notify == 0 || (cfg.notify == 1 && !is_error))
     return;
   memset(&req, 0, sizeof(req));
-  snprintf(req.message, sizeof(req.message), "time-sync: %s", buf);
+  snprintf(req.message, sizeof(req.message), TAG ": %s", buf);
   sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
 }
 
@@ -148,6 +175,10 @@ static void load_config(void) {
       if (*v) snprintf(cfg.servers, sizeof(cfg.servers), "%s", v);
     } else if (!strcasecmp(k, "port")) {
       cfg.port = parse_int(v, 1, 65535, cfg.port);
+    } else if (!strcasecmp(k, "retry_for")) {
+      cfg.retry_for = parse_int(v, 0, 600, cfg.retry_for);
+    } else if (!strcasecmp(k, "unsync_date")) {
+      if (*v) snprintf(cfg.unsync_date, sizeof(cfg.unsync_date), "%s", v);
     } else if (!strcasecmp(k, "timeout")) {
       cfg.timeout = parse_int(v, 1, 60, cfg.timeout);
     } else if (!strcasecmp(k, "notify")) {
@@ -159,6 +190,7 @@ static void load_config(void) {
   fclose(f);
 }
 
+#ifndef UNSYNC
 static void put_be32(uint8_t *p, uint32_t v) {
   p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
 }
@@ -251,50 +283,129 @@ static const char *sntp_query(const char *server, struct timeval *out,
   *rtt_us = rtt;
   return NULL;
 }
+#endif
 
+#ifdef UNSYNC
+/* Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant). */
+static int64_t days_from_civil(int64_t y, int m, int d) {
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+/* Parse "YYYY-MM-DD[ HH:MM[:SS]]" (or with 'T') as UTC. */
+static int parse_date(const char *s, time_t *out) {
+  static const int mdays[] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int y, mo, d, h = 0, mi = 0, se = 0, n;
+  char sep;
+
+  n = sscanf(s, "%d-%d-%d%c%d:%d:%d", &y, &mo, &d, &sep, &h, &mi, &se);
+  if (n != 3 && n < 6) return -1;
+  if (n > 3 && sep != ' ' && sep != 'T') return -1;
+  if (y < 2000 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > mdays[mo - 1] ||
+      h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59)
+    return -1;
+  if (mo == 2 && d == 29 && (y % 4 != 0 || (y % 100 == 0 && y % 400 != 0)))
+    return -1;
+  *out = (time_t)(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se);
+  return 0;
+}
+#endif
+
+static int set_clock(const struct timeval *tv) {
+  if (settimeofday(tv, NULL) == 0) return 0;
+  struct timespec ts = {.tv_sec = tv->tv_sec, .tv_nsec = tv->tv_usec * 1000};
+  return clock_settime(CLOCK_REALTIME, &ts);
+}
+
+static void report_clock(const char *suffix) {
+  struct timeval now;
+  struct tm tmv;
+  time_t t;
+
+  gettimeofday(&now, NULL);
+  t = now.tv_sec;
+  gmtime_r(&t, &tmv);
+  say("OK %04d-%02d-%02d %02d:%02d:%02d UTC%s", tmv.tm_year + 1900,
+      tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+      suffix);
+}
+
+#ifdef UNSYNC
 int main(void) {
-  char list[sizeof(cfg.servers)], *tok, *save = NULL;
-  struct timeval set, now;
-  const char *err = "no servers configured";
-  const char *used = NULL;
-  int64_t rtt = 0;
-  int tried = 0;
+  struct timeval set = {0};
 
   load_config();
+  if (parse_date(cfg.unsync_date, &set.tv_sec) != 0) {
+    fail("FAILED: bad unsync_date \"%s\" (edit " CONF_PATH ")",
+         cfg.unsync_date);
+    return 1;
+  }
+  if (set_clock(&set) != 0) {
+    fail("FAILED: kernel refused to set the clock (privileges?)");
+    return 1;
+  }
+  report_clock(" - run time-sync.elf afterwards");
+  return 0;
+}
+#else
+/* Try each configured server once. Returns the one that answered. */
+static const char *try_servers(char *list, size_t len, struct timeval *set,
+                               int64_t *rtt, const char **err) {
+  char *tok, *save = NULL;
+  int tried = 0;
 
-  snprintf(list, sizeof(list), "%s", cfg.servers);
+  snprintf(list, len, "%s", cfg.servers);
+  *err = "no servers configured";
   for (tok = strtok_r(list, ",", &save); tok && tried < MAX_SERVERS;
        tok = strtok_r(NULL, ",", &save)) {
     char *server = trim(tok);
     if (!*server) continue;
     tried++;
-    printf("[time-sync] querying %s\n", server);
-    if (!(err = sntp_query(server, &set, &rtt))) {
-      used = server;
-      break;
-    }
-    printf("[time-sync] %s: %s\n", server, err);
+    printf("[" TAG "] querying %s\n", server);
+    if (!(*err = sntp_query(server, set, rtt)))
+      return server;
+    printf("[" TAG "] %s: %s\n", server, *err);
+  }
+  return NULL;
+}
+
+static int sync_main(void) {
+  char list[sizeof(cfg.servers)], suffix[160];
+  struct timeval set;
+  const char *err, *used;
+  int64_t rtt = 0;
+  int waited = 0;
+
+  load_config();
+
+  /* The clock may have just been moved by time-unsync, so measure the
+   * retry window with sleep() counts rather than wall-clock time. */
+  while (!(used = try_servers(list, sizeof(list), &set, &rtt, &err)) &&
+         waited + RETRY_PAUSE_SEC <= cfg.retry_for) {
+    printf("[" TAG "] retrying in %ds\n", RETRY_PAUSE_SEC);
+    sleep(RETRY_PAUSE_SEC);
+    waited += RETRY_PAUSE_SEC;
   }
 
   if (!used) {
     fail("FAILED: %s (edit " CONF_PATH ")", err);
     return 1;
   }
-
-  if (settimeofday(&set, NULL) != 0) {
-    struct timespec ts = {.tv_sec = set.tv_sec, .tv_nsec = set.tv_usec * 1000};
-    if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
-      fail("FAILED: kernel refused to set the clock (privileges?)");
-      return 1;
-    }
+  if (set_clock(&set) != 0) {
+    fail("FAILED: kernel refused to set the clock (privileges?)");
+    return 1;
   }
-
-  gettimeofday(&now, NULL);
-  time_t t = now.tv_sec;
-  struct tm tmv;
-  gmtime_r(&t, &tmv);
-  say("OK %04d-%02d-%02d %02d:%02d:%02d UTC via %s (rtt %lld ms)",
-      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour,
-      tmv.tm_min, tmv.tm_sec, used, (long long)(rtt / 1000));
+  snprintf(suffix, sizeof(suffix), " via %s (rtt %lld ms)", used,
+           (long long)(rtt / 1000));
+  report_clock(suffix);
   return 0;
 }
+
+int main(void) {
+  return sync_main();
+}
+#endif

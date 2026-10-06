@@ -50,6 +50,7 @@ jobs:
           name: time-sync
           path: |
             time-sync.elf
+            time-unsync.elf
             config.ini
 
   release:
@@ -72,9 +73,9 @@ jobs:
           TAG: ${{ inputs.release || github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" time-sync.elf config.ini --clobber
+            gh release upload "$TAG" time-sync.elf time-unsync.elf config.ini --clobber
             gh release edit "$TAG" --draft=false --latest
           else
-            gh release create "$TAG" time-sync.elf config.ini \
+            gh release create "$TAG" time-sync.elf time-unsync.elf config.ini \
               --target "$GITHUB_SHA" --title "$TAG" --generate-notes
           fi
