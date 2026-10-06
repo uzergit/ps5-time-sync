@@ -8,8 +8,11 @@
  * and reports what the kernel actually accepted.
  *
  * Built with -DUNSYNC it becomes time-unsync.elf instead, which sets the
- * clock back to a fixed date (unsync_date) so that time-limited payloads,
- * such as etaHEN beta builds, can start. Run time-sync.elf afterwards.
+ * clock back so that time-limited payloads, such as etaHEN beta builds,
+ * can start. In "auto" mode it reads the expiry date out of the etaHEN
+ * payload files in the usual autoloader folders (see etahen_scan.c) and
+ * sets the clock to two days before it; otherwise it uses unsync_date.
+ * Run time-sync.elf afterwards: it waits for etaHEN to come up first.
  *
  * Settings are read from /data/timesyncer/config.ini, which is created
  * with defaults on first run if it does not exist.
@@ -17,6 +20,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <netdb.h>
 #include <stdarg.h>
@@ -30,6 +34,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef UNSYNC
+#include "etahen_scan.h"
+#endif
 
 #ifndef VERSION
 #define VERSION "dev"
@@ -46,6 +54,10 @@
 #define CONF_DIR        "/data/timesyncer"
 #define CONF_PATH       CONF_DIR "/config.ini"
 #define STAMP_PATH      CONF_DIR "/last_update_check"
+#define UNSYNCED_PATH   CONF_DIR "/unsynced" /* time-unsync moved the clock */
+#define ETAHEN_SOCKET   "/system_tmp/etaHEN_crit_service"
+#define EXPIRY_MARGIN_DAYS 2 /* covers the console's time zone offset */
+#define MAX_SCAN_FILES  64
 #define UPDATE_INTERVAL (24 * 60 * 60)
 #define UPDATE_TIMEOUT_US (5 * 1000000U)
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
@@ -67,6 +79,9 @@ typedef struct {
   int retry_for;     /* keep retrying for this many seconds (sync) */
   char unsync_date[32]; /* "YYYY-MM-DD[ HH:MM[:SS]]" UTC (unsync) */
   int update_check;  /* look for a newer release on GitHub (sync) */
+  int unsync_auto;   /* read the date from etaHEN payloads (unsync) */
+  char etahen_path[512]; /* extra files/folders to scan first (unsync) */
+  int etahen_wait;   /* seconds to wait for etaHEN before syncing (sync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -83,6 +98,8 @@ static config_t cfg = {.servers = NTP_SERVER,
                        .notify = 2,
                        .retry_for = 30,
                        .update_check = 1,
+                       .unsync_auto = 1,
+                       .etahen_wait = 60,
                        .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
@@ -111,8 +128,23 @@ static const char default_ini[] =
     "; release and show a notification if there is one: on, off\n"
     "update_check = on\n"
     "\n"
+    "; If time-unsync moved the clock, wait up to this many seconds\n"
+    "; for etaHEN to finish starting before syncing (0 = don't wait).\n"
+    "etahen_wait = 60\n"
+    "\n"
     "[unsync]\n"
-    "; Date time-unsync.elf sets the clock to, in UTC:\n"
+    "; auto:  find the etaHEN payload in the usual autoloader folders,\n"
+    ";        read its expiry date and set the clock 2 days before it.\n"
+    ";        Full (non-beta) releases leave the clock alone. If no\n"
+    ";        etaHEN payload is found, unsync_date is used instead.\n"
+    "; fixed: always use unsync_date.\n"
+    "unsync_mode = auto\n"
+    "\n"
+    "; Extra places to look for etaHEN first, separated by commas\n"
+    "; (files or folders), e.g. /mnt/usb0/payloads/etaHEN.elf\n"
+    "etahen_path =\n"
+    "\n"
+    "; Date to use in fixed mode, or when auto finds nothing. UTC:\n"
     "; YYYY-MM-DD or YYYY-MM-DD HH:MM:SS. Pick a date when your\n"
     "; time-limited payload (e.g. an etaHEN beta) was still valid.\n"
     "unsync_date = 2025-01-01 00:00:00\n";
@@ -196,6 +228,13 @@ static void load_config(void) {
     } else if (!strcasecmp(k, "update_check")) {
       if (!strcasecmp(v, "off") || !strcmp(v, "0")) cfg.update_check = 0;
       else if (!strcasecmp(v, "on") || !strcmp(v, "1")) cfg.update_check = 1;
+    } else if (!strcasecmp(k, "unsync_mode")) {
+      if (!strcasecmp(v, "fixed")) cfg.unsync_auto = 0;
+      else if (!strcasecmp(v, "auto")) cfg.unsync_auto = 1;
+    } else if (!strcasecmp(k, "etahen_path")) {
+      snprintf(cfg.etahen_path, sizeof(cfg.etahen_path), "%s", v);
+    } else if (!strcasecmp(k, "etahen_wait")) {
+      cfg.etahen_wait = parse_int(v, 0, 600, cfg.etahen_wait);
     } else if (!strcasecmp(k, "retry_for")) {
       cfg.retry_for = parse_int(v, 0, 600, cfg.retry_for);
     } else if (!strcasecmp(k, "unsync_date")) {
@@ -342,6 +381,7 @@ static int set_clock(const struct timeval *tv) {
   return clock_settime(CLOCK_REALTIME, &ts);
 }
 
+#ifndef UNSYNC
 static void report_clock(const char *suffix) {
   struct timeval now;
   struct tm tmv;
@@ -354,23 +394,176 @@ static void report_clock(const char *suffix) {
       tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
       suffix);
 }
+#endif
 
 #ifdef UNSYNC
-int main(void) {
-  struct timeval set = {0};
+typedef struct {
+  int files;           /* payload files looked at */
+  int full_releases;   /* etaHEN without an expiry check */
+  int betas;           /* etaHEN with an expiry check */
+  etahen_date_t expiry; /* earliest expiry among the betas */
+  char beta_path[256];
+} scan_result_t;
 
-  load_config();
-  if (parse_date(cfg.unsync_date, &set.tv_sec) != 0) {
-    fail("FAILED: bad unsync_date \"%s\" (edit " CONF_PATH ")",
-         cfg.unsync_date);
-    return 1;
+static int has_payload_ext(const char *name) {
+  size_t n = strlen(name);
+  return n > 4 && (!strcasecmp(name + n - 4, ".elf") ||
+                   !strcasecmp(name + n - 4, ".bin"));
+}
+
+static void scan_file(const char *path, scan_result_t *r) {
+  etahen_date_t d;
+
+  if (r->files >= MAX_SCAN_FILES) return;
+  r->files++;
+  switch (etahen_scan_file(path, &d)) {
+  case ETAHEN_EXPIRES:
+    printf("[" TAG "] %s: etaHEN beta, expires %04d-%02d-%02d\n", path,
+           d.year, d.month, d.day);
+    if (!r->betas || days_from_civil(d.year, d.month, d.day) <
+                         days_from_civil(r->expiry.year, r->expiry.month,
+                                         r->expiry.day)) {
+      r->expiry = d;
+      snprintf(r->beta_path, sizeof(r->beta_path), "%s", path);
+    }
+    r->betas++;
+    break;
+  case ETAHEN_NO_EXPIRY:
+    printf("[" TAG "] %s: etaHEN, no expiry\n", path);
+    r->full_releases++;
+    break;
   }
+}
+
+/* Scan a payload file, or every .elf/.bin directly inside a folder. */
+static void scan_path(const char *path, scan_result_t *r) {
+  struct stat st;
+  struct dirent *e;
+  char full[512];
+  DIR *dir;
+
+  if (stat(path, &st) != 0) return;
+  if (S_ISREG(st.st_mode)) {
+    scan_file(path, r);
+    return;
+  }
+  if (!S_ISDIR(st.st_mode) || !(dir = opendir(path))) return;
+  while ((e = readdir(dir))) {
+    if (e->d_name[0] == '.' || !has_payload_ext(e->d_name)) continue;
+    snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+    scan_file(full, r);
+  }
+  closedir(dir);
+}
+
+/* Autoloader folders: ps5_autoloader and ps5_autoloader_<TITLE_ID>. */
+static void scan_autoloader_dirs(const char *root, scan_result_t *r) {
+  struct dirent *e;
+  char full[512];
+  DIR *dir = opendir(root);
+
+  if (!dir) return;
+  while ((e = readdir(dir))) {
+    if (strncmp(e->d_name, "ps5_autoloader", 14) != 0) continue;
+    snprintf(full, sizeof(full), "%s/%s", root, e->d_name);
+    scan_path(full, r);
+  }
+  closedir(dir);
+}
+
+/* Default locations of the common autoloaders and payload managers,
+ * USB before internal storage as the autoloaders themselves do. */
+static void scan_default_locations(scan_result_t *r) {
+  static const char *pldmgr[] = {"pldmgr", "pldmgr/payloads"};
+  char path[64];
+
+  for (int n = 0; n < 8; n++) {
+    snprintf(path, sizeof(path), "/mnt/usb%d", n);
+    scan_autoloader_dirs(path, r);
+  }
+  scan_autoloader_dirs("/data", r);
+  for (int n = 0; n < 8; n++) {
+    for (size_t i = 0; i < sizeof(pldmgr) / sizeof(*pldmgr); i++) {
+      snprintf(path, sizeof(path), "/mnt/usb%d/%s", n, pldmgr[i]);
+      scan_path(path, r);
+    }
+  }
+  scan_path("/data/pldmgr", r);
+  scan_path("/data/pldmgr/payloads", r);
+  scan_path("/data/etaHEN", r);
+  scan_path("/data", r);
+  for (int n = 0; n < 8; n++) {
+    snprintf(path, sizeof(path), "/mnt/usb%d", n);
+    scan_path(path, r);
+  }
+}
+
+static void scan_configured_paths(scan_result_t *r) {
+  char list[sizeof(cfg.etahen_path)], *tok, *save = NULL;
+
+  snprintf(list, sizeof(list), "%s", cfg.etahen_path);
+  for (tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+    if (*trim(tok)) scan_path(trim(tok), r);
+}
+
+static int unsync_to(time_t when, const char *why) {
+  struct timeval set = {.tv_sec = when};
+  struct tm tmv;
+  FILE *f;
+
   if (set_clock(&set) != 0) {
     fail("FAILED: kernel refused to set the clock (privileges?)");
     return 1;
   }
-  report_clock(" - run time-sync.elf afterwards");
+  /* Tells time-sync to wait for etaHEN before putting the clock back. */
+  if ((f = fopen(UNSYNCED_PATH, "w"))) {
+    fprintf(f, "%lld\n", (long long)when);
+    fclose(f);
+  }
+  gmtime_r(&when, &tmv);
+  say("clock set to %04d-%02d-%02d%s - run time-sync.elf afterwards",
+      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, why);
   return 0;
+}
+
+int main(void) {
+  scan_result_t r;
+  time_t fallback;
+
+  load_config();
+  if (parse_date(cfg.unsync_date, &fallback) != 0) {
+    fail("FAILED: bad unsync_date \"%s\" (edit " CONF_PATH ")",
+         cfg.unsync_date);
+    return 1;
+  }
+  if (!cfg.unsync_auto)
+    return unsync_to(fallback, "");
+
+  memset(&r, 0, sizeof(r));
+  scan_configured_paths(&r);
+  scan_default_locations(&r);
+
+  if (r.betas) {
+    char why[96];
+    time_t target = (time_t)((days_from_civil(r.expiry.year, r.expiry.month,
+                                              r.expiry.day) -
+                              EXPIRY_MARGIN_DAYS) *
+                             86400);
+    snprintf(why, sizeof(why), " (etaHEN beta expires %04d-%02d-%02d)",
+             r.expiry.year, r.expiry.month, r.expiry.day);
+    printf("[" TAG "] using %s\n", r.beta_path);
+    if (time(NULL) < target) {
+      say("etaHEN beta expires %04d-%02d-%02d, not yet - clock unchanged",
+          r.expiry.year, r.expiry.month, r.expiry.day);
+      return 0;
+    }
+    return unsync_to(target, why);
+  }
+  if (r.full_releases) {
+    say("etaHEN found, no expiry date (full release) - clock unchanged");
+    return 0;
+  }
+  return unsync_to(fallback, " (unsync_date: no etaHEN payload found)");
 }
 #else
 /* Try each configured server once. Returns the one that answered. */
@@ -562,6 +755,25 @@ static void check_for_update(void) {
   }
 }
 
+/* After time-unsync, etaHEN checks its expiry date while it starts up.
+ * Its daemon creates this socket once that is done, so wait for it before
+ * putting the clock back. */
+static void wait_for_etahen(void) {
+  struct stat st;
+  int waited = 0;
+
+  if (stat(UNSYNCED_PATH, &st) != 0 || cfg.etahen_wait <= 0) return;
+  while (stat(ETAHEN_SOCKET, &st) != 0 && waited < cfg.etahen_wait) {
+    if (waited == 0)
+      printf("[" TAG "] waiting up to %ds for etaHEN to start\n",
+             cfg.etahen_wait);
+    sleep(1);
+    waited++;
+  }
+  if (waited >= cfg.etahen_wait)
+    printf("[" TAG "] etaHEN not detected, syncing anyway\n");
+}
+
 static int sync_main(void) {
   char list[sizeof(cfg.servers)], suffix[160];
   struct timeval set;
@@ -570,6 +782,7 @@ static int sync_main(void) {
   int waited = 0;
 
   load_config();
+  wait_for_etahen();
 
   /* The clock may have just been moved by time-unsync, so measure the
    * retry window with sleep() counts rather than wall-clock time. */
@@ -591,6 +804,7 @@ static int sync_main(void) {
   snprintf(suffix, sizeof(suffix), " via %s (rtt %lld ms)", used,
            (long long)(rtt / 1000));
   report_clock(suffix);
+  unlink(UNSYNCED_PATH);
 
   /* Only after the clock is right: HTTPS certificates need it. */
   check_for_update();

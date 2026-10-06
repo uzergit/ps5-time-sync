@@ -26,8 +26,12 @@ all: $(ELF) $(UNSYNC_ELF)
 $(ELF): main.c
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(UNSYNC_ELF): main.c
-	$(CC) $(CFLAGS) -DUNSYNC -o $@ $^
+# time-unsync also reads etaHEN payloads, which needs an LZMA decoder
+# (LZMA SDK by Igor Pavlov, public domain, in lzma/).
+UNSYNC_SRC := main.c etahen_scan.c lzma/LzmaDec.c
+
+$(UNSYNC_ELF): $(UNSYNC_SRC) etahen_scan.h
+	$(CC) $(CFLAGS) -DUNSYNC -Ilzma -o $@ $(UNSYNC_SRC)
 
 clean:
 	rm -f $(ELF) $(UNSYNC_ELF)
