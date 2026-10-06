@@ -63,11 +63,18 @@ jobs:
         with:
           name: time-sync
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          # From "Run workflow", create the tag on the commit just built.
-          tag_name: ${{ inputs.release || github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            time-sync.elf
-            config.ini
+      # Publishes an existing (e.g. half-finished draft) release for the tag,
+      # or creates it on the commit just built.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" time-sync.elf config.ini --clobber
+            gh release edit "$TAG" --draft=false --latest
+          else
+            gh release create "$TAG" time-sync.elf config.ini \
+              --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi
