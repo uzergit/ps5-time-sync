@@ -85,9 +85,9 @@ make
 This needs [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) and
 clang/lld 18.
 
-## Caveat (please read)
+## Does the time stick after a reboot?
 
-On FreeBSD-based kernels, `settimeofday()` also writes the hardware clock
-(RTC). **That hasn't been verified on the PS5's kernel.** After a successful
-run, reboot the console and check whether the time stuck. If it didn't, just
-run the payload again after each boot.
+Yes. On FreeBSD-based kernels, `settimeofday()` also writes the hardware
+clock (RTC). This has been confirmed on a real PS5: after a successful sync,
+the time stayed correct through a reboot. You only need to run the payload
+again when the clock has drifted.

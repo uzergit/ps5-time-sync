@@ -3,8 +3,8 @@
  *
  * Queries an NTP server over UDP and sets the system clock with
  * settimeofday(). On FreeBSD-derived kernels settimeofday() also
- * writes the time-of-day (RTC) hardware via resettodr(); this is
- * not verified on Orbis/Prospero, so the payload reads the clock back
+ * writes the time-of-day (RTC) hardware via resettodr(); this has been
+ * confirmed to survive a reboot on a real PS5. The payload reads the clock back
  * and reports what the kernel actually accepted.
  *
  * Settings are read from /data/timesyncer/config.ini, which is created
