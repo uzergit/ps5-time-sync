@@ -239,3 +239,7 @@ again when the clock has drifted.
 
 The same goes for `time-unsync.elf`: its old date also survives a reboot,
 which is why `time-sync.elf` must always run after it.
+
+## Credits
+
+Made by [uzer](https://github.com/uzergit), with help from [Claude](https://claude.ai) by Anthropic.
