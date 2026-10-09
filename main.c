@@ -60,6 +60,8 @@
 #define MAX_SCAN_FILES  64
 #define UPDATE_INTERVAL (24 * 60 * 60)
 #define UPDATE_TIMEOUT_US (5 * 1000000U)
+#define SSL_FLAG_SERVER_VERIFY  0x01 /* sceHttp2SslDisableOption flags */
+#define SSL_FLAG_KNOWN_CA_CHECK 0x20
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
@@ -689,6 +691,7 @@ static int fetch_latest_tag(char *tag, size_t len) {
   int (*H2SendRequest)(int, const void *, size_t);
   int (*H2GetStatusCode)(int, int *);
   int (*H2ReadData)(int, void *, size_t);
+  int (*H2SslDisableOption)(int, uint32_t);
   void *net, *ssl, *http;
   int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, req = -1, status = 0;
   int rc = -1;
@@ -723,6 +726,7 @@ static int fetch_latest_tag(char *tag, size_t len) {
   SYM(H2SendRequest, http, "sceHttp2SendRequest");
   SYM(H2GetStatusCode, http, "sceHttp2GetStatusCode");
   SYM(H2ReadData, http, "sceHttp2ReadData");
+  SYM(H2SslDisableOption, http, "sceHttp2SslDisableOption");
 #undef SYM
 
   /* Each step logs its return value (0x8... codes are SCE errors). */
@@ -738,18 +742,37 @@ static int fetch_latest_tag(char *tag, size_t len) {
   STEP(ctx = H2Init(pool, sslctx, 256 * 1024, 1), "sceHttp2Init");
   STEP(tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1),
        "sceHttp2CreateTemplate");
-  STEP(req = H2CreateRequestWithURL(
-           tmpl, "GET",
-           "https://api.github.com/repos/" UPDATE_REPO "/releases/latest", 0),
-       "sceHttp2CreateRequestWithURL");
-  logmsg("update check: AddRequestHeader = 0x%08x",
-         (unsigned)H2AddRequestHeader(req, "Accept",
-                                      "application/vnd.github+json", 0));
-  logmsg("update check: timeouts = 0x%08x 0x%08x 0x%08x",
-         (unsigned)H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US),
-         (unsigned)H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US),
-         (unsigned)H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US));
-  STEP(H2SendRequest(req, NULL, 0), "sceHttp2SendRequest");
+  /* The PS5's certificate store may not know GitHub's CA (seen on
+   * 12.40: SCE_SSL_ERROR_UNKNOWN_CA). Retry with fewer checks: this
+   * only reads a version number, nothing is downloaded or run. */
+  static const uint32_t relax[] = {0, SSL_FLAG_KNOWN_CA_CHECK,
+                                   SSL_FLAG_KNOWN_CA_CHECK |
+                                       SSL_FLAG_SERVER_VERIFY};
+  for (size_t i = 0; i < sizeof(relax) / sizeof(*relax); i++) {
+    if (relax[i])
+      logmsg("update check: retrying without SSL checks 0x%02x = 0x%08x",
+             (unsigned)relax[i], (unsigned)H2SslDisableOption(tmpl, relax[i]));
+    STEP(req = H2CreateRequestWithURL(
+             tmpl, "GET",
+             "https://api.github.com/repos/" UPDATE_REPO "/releases/latest",
+             0),
+         "sceHttp2CreateRequestWithURL");
+    logmsg("update check: AddRequestHeader = 0x%08x",
+           (unsigned)H2AddRequestHeader(req, "Accept",
+                                        "application/vnd.github+json", 0));
+    logmsg("update check: timeouts = 0x%08x 0x%08x 0x%08x",
+           (unsigned)H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US),
+           (unsigned)H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US),
+           (unsigned)H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US));
+    int sent = H2SendRequest(req, NULL, 0);
+    logmsg("update check: sceHttp2SendRequest = 0x%08x", (unsigned)sent);
+    if (sent >= 0) break;
+    H2DeleteRequest(req);
+    req = -1;
+    /* Only certificate problems are worth retrying. */
+    if (((unsigned)sent & 0xffffff00u) != 0x8095f000u) goto out;
+  }
+  if (req < 0) goto out;
   STEP(H2GetStatusCode(req, &status), "sceHttp2GetStatusCode");
 #undef STEP
   logmsg("update check: HTTP status %d", status);
