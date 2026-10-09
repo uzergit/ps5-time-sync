@@ -7,6 +7,10 @@ on:
         description: "Release tag to publish (e.g. v1.0). Leave empty to only build."
         required: false
         default: ""
+      prerelease:
+        description: "Publish as a pre-release (test builds; never shown as latest)"
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["v*"]
@@ -75,11 +79,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release || github.ref_name }}
+          PRERELEASE: ${{ inputs.prerelease && 'true' || 'false' }}
         run: |
+          if [ "$PRERELEASE" = true ]; then
+            kind="--prerelease"
+          else
+            kind="--latest"
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" time-sync.elf time-unsync.elf config.ini --clobber
-            gh release edit "$TAG" --draft=false --latest
+            gh release edit "$TAG" --draft=false $kind
           else
             gh release create "$TAG" time-sync.elf time-unsync.elf config.ini \
-              --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+              --target "$GITHUB_SHA" --title "$TAG" --generate-notes $kind
           fi

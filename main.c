@@ -149,13 +149,42 @@ static const char default_ini[] =
     "; time-limited payload (e.g. an etaHEN beta) was still valid.\n"
     "unsync_date = 2025-01-01 00:00:00\n";
 
+/* Everything printed also goes to CONF_DIR/<tag>.log, which is easy to
+ * fetch over FTP when a payload's stdout isn't visible anywhere. */
+static FILE *logfile;
+
+static void log_open(void) {
+  mkdir(CONF_DIR, 0777);
+  logfile = fopen(CONF_DIR "/" TAG ".log", "w");
+  if (logfile) {
+    time_t t = time(NULL);
+    fprintf(logfile, "[" TAG "] " TAG " " VERSION ", clock %lld\n",
+            (long long)t);
+    fflush(logfile);
+  }
+}
+
+static void logmsg(const char *fmt, ...) {
+  char buf[512];
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  printf("[" TAG "] %s\n", buf);
+  fflush(stdout);
+  if (logfile) {
+    fprintf(logfile, "[" TAG "] %s\n", buf);
+    fflush(logfile);
+  }
+}
+
 static void vsay(int is_error, const char *fmt, va_list ap) {
   char buf[256];
   notify_request_t req;
 
   vsnprintf(buf, sizeof(buf), fmt, ap);
-  printf("[" TAG "] %s\n", buf);
-  fflush(stdout);
+  logmsg("%s", buf);
 
   if (cfg.notify == 0 || (cfg.notify == 1 && !is_error))
     return;
@@ -418,7 +447,7 @@ static void scan_file(const char *path, scan_result_t *r) {
   r->files++;
   switch (etahen_scan_file(path, &d)) {
   case ETAHEN_EXPIRES:
-    printf("[" TAG "] %s: etaHEN beta, expires %04d-%02d-%02d\n", path,
+    logmsg("%s: etaHEN beta, expires %04d-%02d-%02d", path,
            d.year, d.month, d.day);
     if (!r->betas || days_from_civil(d.year, d.month, d.day) <
                          days_from_civil(r->expiry.year, r->expiry.month,
@@ -429,7 +458,7 @@ static void scan_file(const char *path, scan_result_t *r) {
     r->betas++;
     break;
   case ETAHEN_NO_EXPIRY:
-    printf("[" TAG "] %s: etaHEN, no expiry\n", path);
+    logmsg("%s: etaHEN, no expiry", path);
     r->full_releases++;
     break;
   }
@@ -530,6 +559,7 @@ int main(void) {
   scan_result_t r;
   time_t fallback;
 
+  log_open();
   load_config();
   if (parse_date(cfg.unsync_date, &fallback) != 0) {
     fail("FAILED: bad unsync_date \"%s\" (edit " CONF_PATH ")",
@@ -551,7 +581,7 @@ int main(void) {
                              86400);
     snprintf(why, sizeof(why), " (etaHEN beta expires %04d-%02d-%02d)",
              r.expiry.year, r.expiry.month, r.expiry.day);
-    printf("[" TAG "] using %s\n", r.beta_path);
+    logmsg("using %s", r.beta_path);
     if (time(NULL) < target) {
       say("etaHEN beta expires %04d-%02d-%02d, not yet - clock unchanged",
           r.expiry.year, r.expiry.month, r.expiry.day);
@@ -579,10 +609,10 @@ static const char *try_servers(char *list, size_t len, struct timeval *set,
     char *server = trim(tok);
     if (!*server) continue;
     tried++;
-    printf("[" TAG "] querying %s\n", server);
+    logmsg("querying %s", server);
     if (!(*err = sntp_query(server, set, rtt)))
       return server;
-    printf("[" TAG "] %s: %s\n", server, *err);
+    logmsg("%s: %s", server, *err);
   }
   return NULL;
 }
@@ -626,6 +656,20 @@ static void stamp_check(time_t now) {
 /* Fetch the latest release tag over HTTPS with the system's own network
  * libraries. They are loaded at run time, so a console where they are
  * unavailable just skips the check instead of failing to load the ELF. */
+/* System libraries by name, falling back to their full path. */
+static void *open_lib(const char *name) {
+  char path[128];
+  void *h = dlopen(name, RTLD_LAZY);
+
+  if (!h) {
+    logmsg("update check: dlopen %s: %s", name, dlerror());
+    snprintf(path, sizeof(path), "/system/common/lib/%s", name);
+    if (!(h = dlopen(path, RTLD_LAZY)))
+      logmsg("update check: dlopen %s: %s", path, dlerror());
+  }
+  return h;
+}
+
 static int fetch_latest_tag(char *tag, size_t len) {
   int (*NetInit)(void);
   int (*NetPoolCreate)(const char *, int, int);
@@ -651,16 +695,16 @@ static int fetch_latest_tag(char *tag, size_t len) {
   static char body[32 * 1024];
   size_t got = 0;
 
-  net = dlopen("libSceNet.sprx", RTLD_LAZY);
-  ssl = dlopen("libSceSsl.sprx", RTLD_LAZY);
-  http = dlopen("libSceHttp2.sprx", RTLD_LAZY);
-  if (!net || !ssl || !http) {
-    printf("[" TAG "] update check: cannot load network libraries\n");
-    goto out;
-  }
+  net = open_lib("libSceNet.sprx");
+  ssl = open_lib("libSceSsl.sprx");
+  http = open_lib("libSceHttp2.sprx");
+  if (!net || !ssl || !http) goto out;
 
-#define SYM(var, lib, name) \
-  if (!(*(void **)&var = dlsym(lib, name))) goto out
+#define SYM(var, lib, name)                                    \
+  if (!(*(void **)&var = dlsym(lib, name))) {                  \
+    logmsg("update check: %s not found: %s", name, dlerror()); \
+    goto out;                                                  \
+  }
   SYM(NetInit, net, "sceNetInit");
   SYM(NetPoolCreate, net, "sceNetPoolCreate");
   SYM(NetPoolDestroy, net, "sceNetPoolDestroy");
@@ -681,29 +725,35 @@ static int fetch_latest_tag(char *tag, size_t len) {
   SYM(H2ReadData, http, "sceHttp2ReadData");
 #undef SYM
 
-  NetInit();
-  if ((pool = NetPoolCreate(TAG, 32 * 1024, 0)) < 0) goto out;
-  if ((sslctx = SslInit(256 * 1024)) < 0) goto out;
-  if ((ctx = H2Init(pool, sslctx, 256 * 1024, 1)) < 0) goto out;
-  if ((tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1)) < 0) goto out;
-  if ((req = H2CreateRequestWithURL(
+  /* Each step logs its return value (0x8... codes are SCE errors). */
+#define STEP(expr, what)                                       \
+  do {                                                         \
+    int r_ = (expr);                                           \
+    logmsg("update check: %s = 0x%08x", what, (unsigned)r_);   \
+    if (r_ < 0) goto out;                                      \
+  } while (0)
+  STEP(NetInit(), "sceNetInit (errors here are harmless)") ;
+  STEP(pool = NetPoolCreate(TAG, 32 * 1024, 0), "sceNetPoolCreate");
+  STEP(sslctx = SslInit(256 * 1024), "sceSslInit");
+  STEP(ctx = H2Init(pool, sslctx, 256 * 1024, 1), "sceHttp2Init");
+  STEP(tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1),
+       "sceHttp2CreateTemplate");
+  STEP(req = H2CreateRequestWithURL(
            tmpl, "GET",
-           "https://api.github.com/repos/" UPDATE_REPO "/releases/latest",
-           0)) < 0)
-    goto out;
-  H2AddRequestHeader(req, "Accept", "application/vnd.github+json", 0);
-  H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US);
-  H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US);
-  H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US);
-
-  if (H2SendRequest(req, NULL, 0) || H2GetStatusCode(req, &status)) {
-    printf("[" TAG "] update check: request failed\n");
-    goto out;
-  }
-  if (status != 200) {
-    printf("[" TAG "] update check: HTTP %d\n", status);
-    goto out;
-  }
+           "https://api.github.com/repos/" UPDATE_REPO "/releases/latest", 0),
+       "sceHttp2CreateRequestWithURL");
+  logmsg("update check: AddRequestHeader = 0x%08x",
+         (unsigned)H2AddRequestHeader(req, "Accept",
+                                      "application/vnd.github+json", 0));
+  logmsg("update check: timeouts = 0x%08x 0x%08x 0x%08x",
+         (unsigned)H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US),
+         (unsigned)H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US),
+         (unsigned)H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US));
+  STEP(H2SendRequest(req, NULL, 0), "sceHttp2SendRequest");
+  STEP(H2GetStatusCode(req, &status), "sceHttp2GetStatusCode");
+#undef STEP
+  logmsg("update check: HTTP status %d", status);
+  if (status != 200) goto out;
   for (;;) {
     int n = H2ReadData(req, body + got, sizeof(body) - 1 - got);
     if (n <= 0) break;
@@ -711,6 +761,7 @@ static int fetch_latest_tag(char *tag, size_t len) {
     if (got >= sizeof(body) - 1) break;
   }
   body[got] = 0;
+  logmsg("update check: read %u bytes", (unsigned)got);
 
   /* Minimal JSON lookup: "tag_name": "v1.2" */
   char *p = strstr(body, "\"tag_name\"");
@@ -720,6 +771,7 @@ static int fetch_latest_tag(char *tag, size_t len) {
     tag[i] = 0;
     rc = i ? 0 : -1;
   }
+  if (rc != 0) logmsg("update check: no tag_name in reply: %.120s", body);
 
 out:
   if (req >= 0) H2DeleteRequest(req);
@@ -737,13 +789,22 @@ static void check_for_update(void) {
   char latest[64];
   time_t now = time(NULL);
 
-  if (!cfg.update_check || !strcmp(VERSION, "dev") || checked_recently(now))
+  if (!cfg.update_check || !strcmp(VERSION, "dev")) {
+    logmsg("update check: off (update_check = off, or a dev build)");
     return;
-  if (fetch_latest_tag(latest, sizeof(latest)) != 0)
-    return; /* try again on the next run */
+  }
+  if (checked_recently(now)) {
+    logmsg("update check: already done in the last 24 h (" STAMP_PATH ")");
+    return;
+  }
+  logmsg("update check: asking GitHub for the latest release");
+  if (fetch_latest_tag(latest, sizeof(latest)) != 0) {
+    logmsg("update check: failed, will retry on the next run");
+    return;
+  }
   stamp_check(now);
 
-  printf("[" TAG "] running " VERSION ", latest is %s\n", latest);
+  logmsg("running " VERSION ", latest is %s", latest);
   if (version_newer(latest, VERSION) && cfg.notify) {
     notify_request_t req;
     memset(&req, 0, sizeof(req));
@@ -752,6 +813,7 @@ static void check_for_update(void) {
                  ") - github.com/" UPDATE_REPO "/releases",
              latest);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+    logmsg("update check: notified about %s", latest);
   }
 }
 
@@ -765,13 +827,13 @@ static void wait_for_etahen(void) {
   if (stat(UNSYNCED_PATH, &st) != 0 || cfg.etahen_wait <= 0) return;
   while (stat(ETAHEN_SOCKET, &st) != 0 && waited < cfg.etahen_wait) {
     if (waited == 0)
-      printf("[" TAG "] waiting up to %ds for etaHEN to start\n",
+      logmsg("waiting up to %ds for etaHEN to start",
              cfg.etahen_wait);
     sleep(1);
     waited++;
   }
   if (waited >= cfg.etahen_wait)
-    printf("[" TAG "] etaHEN not detected, syncing anyway\n");
+    logmsg("etaHEN not detected, syncing anyway");
 }
 
 static int sync_main(void) {
@@ -781,6 +843,7 @@ static int sync_main(void) {
   int64_t rtt = 0;
   int waited = 0;
 
+  log_open();
   load_config();
   wait_for_etahen();
 
@@ -788,7 +851,7 @@ static int sync_main(void) {
    * retry window with sleep() counts rather than wall-clock time. */
   while (!(used = try_servers(list, sizeof(list), &set, &rtt, &err)) &&
          waited + RETRY_PAUSE_SEC <= cfg.retry_for) {
-    printf("[" TAG "] retrying in %ds\n", RETRY_PAUSE_SEC);
+    logmsg("retrying in %ds", RETRY_PAUSE_SEC);
     sleep(RETRY_PAUSE_SEC);
     waited += RETRY_PAUSE_SEC;
   }
