@@ -59,9 +59,6 @@
 #define EXPIRY_MARGIN_DAYS 2 /* covers the console's time zone offset */
 #define MAX_SCAN_FILES  64
 #define UPDATE_INTERVAL (24 * 60 * 60)
-#define UPDATE_TIMEOUT_US (5 * 1000000U)
-#define SSL_FLAG_SERVER_VERIFY  0x01 /* sceHttp2SslDisableOption flags */
-#define SSL_FLAG_KNOWN_CA_CHECK 0x20
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
@@ -721,35 +718,46 @@ static void *open_lib(const char *name) {
   return h;
 }
 
+/* sceHttp asks this whether to accept the server's certificate chain.
+ * Some firmwares (seen on 12.40) don't know GitHub's CA and would refuse
+ * it (SCE_SSL_ERROR_UNKNOWN_CA), so accept it, as ps5-payload-dev's
+ * elfldr does. We only read a version number; nothing is downloaded. */
+static int accept_cert(void) { return 0; }
+
+/* Fetch the latest release tag over HTTPS with the system's libSceHttp,
+ * following the same calls as ps5-payload-dev/elfldr (uri.c). The
+ * libraries are loaded at run time, so a console where they are missing
+ * just skips the check instead of failing to load the ELF. */
 static int fetch_latest_tag(char *tag, size_t len) {
   int (*NetInit)(void);
   int (*NetPoolCreate)(const char *, int, int);
   int (*NetPoolDestroy)(int);
   int (*SslInit)(size_t);
   int (*SslTerm)(int);
-  int (*H2Init)(int, int, size_t, int);
-  int (*H2Term)(int);
-  int (*H2CreateTemplate)(int, const char *, int, int);
-  int (*H2DeleteTemplate)(int);
-  int (*H2CreateRequestWithURL)(int, const char *, const char *, uint64_t);
-  int (*H2DeleteRequest)(int);
-  int (*H2AddRequestHeader)(int, const char *, const char *, int);
-  int (*H2SetResolveTimeOut)(int, uint32_t);
-  int (*H2SetConnectTimeOut)(int, uint32_t);
-  int (*H2SetRecvTimeOut)(int, uint32_t);
-  int (*H2SendRequest)(int, const void *, size_t);
-  int (*H2GetStatusCode)(int, int *);
-  int (*H2ReadData)(int, void *, size_t);
-  int (*H2SslDisableOption)(int, uint32_t);
+  int (*HttpInit)(int, int, size_t);
+  int (*HttpTerm)(int);
+  int (*CreateTemplate)(int, const char *, int, int);
+  int (*SetSslCallback)(int, void *, void *);
+  int (*SetResponseHeaderMaxSize)(int, size_t);
+  int (*DeleteTemplate)(int);
+  int (*CreateConnectionWithURL)(int, const char *, int);
+  int (*DeleteConnection)(int);
+  int (*CreateRequestWithURL)(int, int, const char *, uint64_t);
+  int (*DeleteRequest)(int);
+  int (*SendRequest)(int, const void *, size_t);
+  int (*GetStatusCode)(int, int *);
+  int (*ReadData)(int, void *, size_t);
+  static const char url[] =
+      "https://api.github.com/repos/" UPDATE_REPO "/releases/latest";
   void *net, *ssl, *http;
-  int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, req = -1, status = 0;
-  int rc = -1;
+  int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, conn = -1, req = -1;
+  int status = 0, rc = -1;
   static char body[32 * 1024];
   size_t got = 0;
 
   net = open_lib("libSceNet.sprx");
   ssl = open_lib("libSceSsl.sprx");
-  http = open_lib("libSceHttp2.sprx");
+  http = open_lib("libSceHttp.sprx");
   if (!net || !ssl || !http) goto out;
 
 #define SYM(var, lib, name)                                    \
@@ -762,72 +770,53 @@ static int fetch_latest_tag(char *tag, size_t len) {
   SYM(NetPoolDestroy, net, "sceNetPoolDestroy");
   SYM(SslInit, ssl, "sceSslInit");
   SYM(SslTerm, ssl, "sceSslTerm");
-  SYM(H2Init, http, "sceHttp2Init");
-  SYM(H2Term, http, "sceHttp2Term");
-  SYM(H2CreateTemplate, http, "sceHttp2CreateTemplate");
-  SYM(H2DeleteTemplate, http, "sceHttp2DeleteTemplate");
-  SYM(H2CreateRequestWithURL, http, "sceHttp2CreateRequestWithURL");
-  SYM(H2DeleteRequest, http, "sceHttp2DeleteRequest");
-  SYM(H2AddRequestHeader, http, "sceHttp2AddRequestHeader");
-  SYM(H2SetResolveTimeOut, http, "sceHttp2SetResolveTimeOut");
-  SYM(H2SetConnectTimeOut, http, "sceHttp2SetConnectTimeOut");
-  SYM(H2SetRecvTimeOut, http, "sceHttp2SetRecvTimeOut");
-  SYM(H2SendRequest, http, "sceHttp2SendRequest");
-  SYM(H2GetStatusCode, http, "sceHttp2GetStatusCode");
-  SYM(H2ReadData, http, "sceHttp2ReadData");
-  SYM(H2SslDisableOption, http, "sceHttp2SslDisableOption");
+  SYM(HttpInit, http, "sceHttpInit");
+  SYM(HttpTerm, http, "sceHttpTerm");
+  SYM(CreateTemplate, http, "sceHttpCreateTemplate");
+  SYM(SetSslCallback, http, "sceHttpsSetSslCallback");
+  SYM(SetResponseHeaderMaxSize, http, "sceHttpSetResponseHeaderMaxSize");
+  SYM(DeleteTemplate, http, "sceHttpDeleteTemplate");
+  SYM(CreateConnectionWithURL, http, "sceHttpCreateConnectionWithURL");
+  SYM(DeleteConnection, http, "sceHttpDeleteConnection");
+  SYM(CreateRequestWithURL, http, "sceHttpCreateRequestWithURL");
+  SYM(DeleteRequest, http, "sceHttpDeleteRequest");
+  SYM(SendRequest, http, "sceHttpSendRequest");
+  SYM(GetStatusCode, http, "sceHttpGetStatusCode");
+  SYM(ReadData, http, "sceHttpReadData");
 #undef SYM
 
-  /* Each step logs its return value (0x8... codes are SCE errors). */
+  /* Each step logs its return value (0x8... codes are SCE errors). The
+   * line is written before the next call, so if the payload ever dies
+   * the last log line shows where. */
 #define STEP(expr, what)                                       \
   do {                                                         \
     int r_ = (expr);                                           \
     logmsg("update check: %s = 0x%08x", what, (unsigned)r_);   \
     if (r_ < 0) goto out;                                      \
   } while (0)
-  STEP(NetInit(), "sceNetInit (errors here are harmless)") ;
-  STEP(pool = NetPoolCreate(TAG, 32 * 1024, 0), "sceNetPoolCreate");
-  STEP(sslctx = SslInit(256 * 1024), "sceSslInit");
-  STEP(ctx = H2Init(pool, sslctx, 256 * 1024, 1), "sceHttp2Init");
-  STEP(tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1),
-       "sceHttp2CreateTemplate");
-  /* The PS5's certificate store may not know GitHub's CA (seen on
-   * 12.40: SCE_SSL_ERROR_UNKNOWN_CA). Retry with fewer checks: this
-   * only reads a version number, nothing is downloaded or run. */
-  static const uint32_t relax[] = {0, SSL_FLAG_KNOWN_CA_CHECK,
-                                   SSL_FLAG_KNOWN_CA_CHECK |
-                                       SSL_FLAG_SERVER_VERIFY};
-  for (size_t i = 0; i < sizeof(relax) / sizeof(*relax); i++) {
-    if (relax[i])
-      logmsg("update check: retrying without SSL checks 0x%02x = 0x%08x",
-             (unsigned)relax[i], (unsigned)H2SslDisableOption(tmpl, relax[i]));
-    STEP(req = H2CreateRequestWithURL(
-             tmpl, "GET",
-             "https://api.github.com/repos/" UPDATE_REPO "/releases/latest",
-             0),
-         "sceHttp2CreateRequestWithURL");
-    logmsg("update check: AddRequestHeader = 0x%08x",
-           (unsigned)H2AddRequestHeader(req, "Accept",
-                                        "application/vnd.github+json", 0));
-    logmsg("update check: timeouts = 0x%08x 0x%08x 0x%08x",
-           (unsigned)H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US),
-           (unsigned)H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US),
-           (unsigned)H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US));
-    int sent = H2SendRequest(req, NULL, 0);
-    logmsg("update check: sceHttp2SendRequest = 0x%08x", (unsigned)sent);
-    if (sent >= 0) break;
-    H2DeleteRequest(req);
-    req = -1;
-    /* Only certificate problems are worth retrying. */
-    if (((unsigned)sent & 0xffffff00u) != 0x8095f000u) goto out;
-  }
-  if (req < 0) goto out;
-  STEP(H2GetStatusCode(req, &status), "sceHttp2GetStatusCode");
+  logmsg("update check: sceNetInit = 0x%08x (errors here are harmless)",
+         (unsigned)NetInit());
+  STEP(pool = NetPoolCreate(TAG, 16 * 1024, 0), "sceNetPoolCreate");
+  STEP(sslctx = SslInit(128 * 1024), "sceSslInit");
+  STEP(ctx = HttpInit(pool, sslctx, 32 * 1024), "sceHttpInit");
+  STEP(tmpl = CreateTemplate(ctx, TAG "/" VERSION, 2, 1),
+       "sceHttpCreateTemplate");
+  STEP(SetResponseHeaderMaxSize(tmpl, 0x2000),
+       "sceHttpSetResponseHeaderMaxSize");
+  STEP(SetSslCallback(tmpl, (void *)accept_cert, NULL),
+       "sceHttpsSetSslCallback");
+  STEP(conn = CreateConnectionWithURL(tmpl, url, 0),
+       "sceHttpCreateConnectionWithURL");
+  STEP(req = CreateRequestWithURL(conn, 0 /* GET */, url, 0),
+       "sceHttpCreateRequestWithURL");
+  STEP(SendRequest(req, NULL, 0), "sceHttpSendRequest");
+  STEP(GetStatusCode(req, &status), "sceHttpGetStatusCode");
 #undef STEP
   logmsg("update check: HTTP status %d", status);
   if (status != 200) goto out;
+
   for (;;) {
-    int n = H2ReadData(req, body + got, sizeof(body) - 1 - got);
+    int n = ReadData(req, body + got, sizeof(body) - 1 - got);
     if (n <= 0) break;
     got += n;
     if (got >= sizeof(body) - 1) break;
@@ -846,9 +835,10 @@ static int fetch_latest_tag(char *tag, size_t len) {
   if (rc != 0) logmsg("update check: no tag_name in reply: %.120s", body);
 
 out:
-  if (req >= 0) H2DeleteRequest(req);
-  if (tmpl >= 0) H2DeleteTemplate(tmpl);
-  if (ctx >= 0) H2Term(ctx);
+  if (req >= 0) DeleteRequest(req);
+  if (conn >= 0) DeleteConnection(conn);
+  if (tmpl >= 0) DeleteTemplate(tmpl);
+  if (ctx >= 0) HttpTerm(ctx);
   if (sslctx >= 0) SslTerm(sslctx);
   if (pool >= 0) NetPoolDestroy(pool);
   if (http) dlclose(http);

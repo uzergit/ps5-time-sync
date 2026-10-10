@@ -245,10 +245,10 @@ time-sync: update v1.3 available (you have v1.2) - github.com/uzergit/ps5-time-s
   If those libraries can't be loaded, the check is skipped and the time sync
   still works.
 - Some firmwares (seen on 12.40) don't recognise the authority behind
-  GitHub's certificate. In that case the check retries without that
-  certificate check. That's acceptable here because it only reads a version
-  number; a forged reply could at worst show a wrong "update available"
-  notification.
+  GitHub's certificate, so, like the ps5-payload-dev ELF loader, the check
+  accepts the certificate it is given. That's acceptable here because it only
+  reads a version number; a forged reply could at worst show a wrong
+  "update available" notification.
 - It doesn't download or install anything: you update by grabbing the new
   `.elf` from the Releases page.
 - Turn it off with `update_check = off` in `config.ini`.
