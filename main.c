@@ -54,16 +54,21 @@
 #define CONF_DIR        "/data/timesyncer"
 #define CONF_PATH       CONF_DIR "/config.ini"
 #define STAMP_PATH      CONF_DIR "/last_update_check"
+#define PLDMGR_DIR      "/data/pldmgr"
+#define PLDMGR_SOURCES  PLDMGR_DIR "/sources.json"
+#define PLDMGR_MARKER   CONF_DIR "/pldmgr_source_added"
+#define PLDMGR_SOURCE_URL \
+  "https://github.com/" UPDATE_REPO "/releases/latest/download/payloads.json"
 #define UNSYNCED_PATH   CONF_DIR "/unsynced" /* time-unsync moved the clock */
 #define ETAHEN_SOCKET   "/system_tmp/etaHEN_crit_service"
 #define EXPIRY_MARGIN_DAYS 2 /* covers the console's time zone offset */
 #define MAX_SCAN_FILES  64
 #define UPDATE_INTERVAL (24 * 60 * 60)
-#define UPDATE_TIMEOUT_US (5 * 1000000U)
 #define NTP_UNIX_DELTA  2208988800ULL /* 1900-01-01 -> 1970-01-01 */
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
 #define RETRY_PAUSE_SEC 3
+#define SAMPLE_GAP_US   250000 /* between samples; polite to the server */
 
 #ifdef UNSYNC
 #define TAG "time-unsync"
@@ -82,6 +87,8 @@ typedef struct {
   int unsync_auto;   /* read the date from etaHEN payloads (unsync) */
   char etahen_path[512]; /* extra files/folders to scan first (unsync) */
   int etahen_wait;   /* seconds to wait for etaHEN before syncing (sync) */
+  int samples;       /* NTP measurements per server, best one wins (sync) */
+  int pldmgr_source; /* add our repository to Payload Manager once (sync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -100,6 +107,8 @@ static config_t cfg = {.servers = NTP_SERVER,
                        .update_check = 1,
                        .unsync_auto = 1,
                        .etahen_wait = 60,
+                       .samples = 4,
+                       .pldmgr_source = 1,
                        .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
@@ -117,6 +126,10 @@ static const char default_ini[] =
     "; Seconds to wait for each server before trying the next.\n"
     "timeout = 2\n"
     "\n"
+    "; Measurements per server (1-8). The one with the shortest network\n"
+    "; delay is used, which gives the most accurate time.\n"
+    "samples = 4\n"
+    "\n"
     "; time-sync keeps retrying for this many seconds if no server\n"
     "; answers, e.g. while the network is still coming up at boot.\n"
     "retry_for = 30\n"
@@ -127,6 +140,10 @@ static const char default_ini[] =
     "; After syncing, check GitHub (at most once a day) for a newer\n"
     "; release and show a notification if there is one: on, off\n"
     "update_check = on\n"
+    "\n"
+    "; If PS5 Payload Manager is installed, add this project's repository\n"
+    "; to its sources once, so it offers Update buttons: on, off\n"
+    "pldmgr_source = on\n"
     "\n"
     "; If time-unsync moved the clock, wait up to this many seconds\n"
     "; for etaHEN to finish starting before syncing (0 = don't wait).\n"
@@ -149,13 +166,42 @@ static const char default_ini[] =
     "; time-limited payload (e.g. an etaHEN beta) was still valid.\n"
     "unsync_date = 2025-01-01 00:00:00\n";
 
+/* Everything printed also goes to CONF_DIR/<tag>.log, which is easy to
+ * fetch over FTP when a payload's stdout isn't visible anywhere. */
+static FILE *logfile;
+
+static void log_open(void) {
+  mkdir(CONF_DIR, 0777);
+  logfile = fopen(CONF_DIR "/" TAG ".log", "w");
+  if (logfile) {
+    time_t t = time(NULL);
+    fprintf(logfile, "[" TAG "] " TAG " " VERSION ", clock %lld\n",
+            (long long)t);
+    fflush(logfile);
+  }
+}
+
+static void logmsg(const char *fmt, ...) {
+  char buf[512];
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  printf("[" TAG "] %s\n", buf);
+  fflush(stdout);
+  if (logfile) {
+    fprintf(logfile, "[" TAG "] %s\n", buf);
+    fflush(logfile);
+  }
+}
+
 static void vsay(int is_error, const char *fmt, va_list ap) {
   char buf[256];
   notify_request_t req;
 
   vsnprintf(buf, sizeof(buf), fmt, ap);
-  printf("[" TAG "] %s\n", buf);
-  fflush(stdout);
+  logmsg("%s", buf);
 
   if (cfg.notify == 0 || (cfg.notify == 1 && !is_error))
     return;
@@ -233,6 +279,11 @@ static void load_config(void) {
       else if (!strcasecmp(v, "auto")) cfg.unsync_auto = 1;
     } else if (!strcasecmp(k, "etahen_path")) {
       snprintf(cfg.etahen_path, sizeof(cfg.etahen_path), "%s", v);
+    } else if (!strcasecmp(k, "pldmgr_source")) {
+      if (!strcasecmp(v, "off") || !strcmp(v, "0")) cfg.pldmgr_source = 0;
+      else if (!strcasecmp(v, "on") || !strcmp(v, "1")) cfg.pldmgr_source = 1;
+    } else if (!strcasecmp(k, "samples")) {
+      cfg.samples = parse_int(v, 1, 8, cfg.samples);
     } else if (!strcasecmp(k, "etahen_wait")) {
       cfg.etahen_wait = parse_int(v, 0, 600, cfg.etahen_wait);
     } else if (!strcasecmp(k, "retry_for")) {
@@ -266,15 +317,39 @@ static int64_t usec_of(const struct timeval *tv) {
 
 /* Query one server. On success fills *out and *rtt_us and returns NULL,
  * otherwise returns a short reason. */
-static const char *sntp_query(const char *server, struct timeval *out,
-                              int64_t *rtt_us) {
+/* An NTP timestamp (seconds since 1900 + 32-bit fraction) in Unix
+ * microseconds. Era 0 ends in 2036; values below the 1970 offset are
+ * taken to be era 1. */
+static int64_t ntp_to_unix_us(const uint8_t *p) {
+  uint32_t secs = get_be32(p), frac = get_be32(p + 4);
+  int64_t unix_s = (secs >= NTP_UNIX_DELTA)
+                       ? (int64_t)secs - (int64_t)NTP_UNIX_DELTA
+                       : (int64_t)secs + (1LL << 32) - (int64_t)NTP_UNIX_DELTA;
+  return unix_s * 1000000LL + (int64_t)(((uint64_t)frac * 1000000ULL) >> 32);
+}
+
+/* Measure how far the local clock is from the server's, using the standard
+ * NTP on-wire calculation:
+ *
+ *   t1 = we send, t2 = server receives, t3 = server replies, t4 = we receive
+ *   offset = ((t2 - t1) + (t3 - t4)) / 2
+ *   delay  = (t4 - t1) - (t3 - t2)
+ *
+ * This cancels the server's own processing time and assumes only that the
+ * network path is equally slow in both directions. Network delay varies from
+ * packet to packet, and the error of a sample is at most half its delay, so
+ * we take several samples and keep the one with the smallest delay. On
+ * success returns NULL and fills *offset_us (add to the local clock),
+ * *delay_us and *good (samples used); otherwise a short reason. */
+static const char *sntp_query(const char *server, int64_t *offset_us,
+                              int64_t *delay_us, int *good) {
   char port[8];
   struct addrinfo hints, *res = NULL;
-  struct timeval tmo, t1, t4;
-  uint8_t req[48], rsp[48];
-  ssize_t n;
+  struct timeval tmo, tv;
+  const char *err = "no reply (timeout)";
   int fd;
 
+  *good = 0;
   snprintf(port, sizeof(port), "%d", cfg.port);
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
@@ -291,57 +366,73 @@ static const char *sntp_query(const char *server, struct timeval *out,
   tmo.tv_usec = 0;
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
 
-  /* LI=0, VN=4, Mode=3 (client). The transmit timestamp doubles as a
-   * nonce: the server must echo it back in its originate field. */
-  memset(req, 0, sizeof(req));
-  req[0] = (0 << 6) | (4 << 3) | 3;
-  gettimeofday(&t1, NULL);
-  put_be32(&req[40], (uint32_t)(t1.tv_sec + NTP_UNIX_DELTA));
-  put_be32(&req[44], (uint32_t)(((uint64_t)t1.tv_usec << 32) / 1000000ULL));
+  for (int i = 0; i < cfg.samples; i++) {
+    uint8_t req[48], rsp[48];
+    int64_t t1, t2, t3, t4;
+    ssize_t n = -1;
 
-  if (sendto(fd, req, sizeof(req), 0, res->ai_addr, res->ai_addrlen) !=
-      (ssize_t)sizeof(req)) {
-    close(fd);
-    freeaddrinfo(res);
-    return "sendto() failed";
+    if (i > 0) usleep(SAMPLE_GAP_US);
+
+    /* LI=0, VN=4, Mode=3 (client). The transmit timestamp doubles as a
+     * nonce: the server must echo it back in its originate field. */
+    memset(req, 0, sizeof(req));
+    req[0] = (0 << 6) | (4 << 3) | 3;
+    gettimeofday(&tv, NULL);
+    t1 = usec_of(&tv);
+    put_be32(&req[40], (uint32_t)(tv.tv_sec + NTP_UNIX_DELTA));
+    put_be32(&req[44], (uint32_t)(((uint64_t)tv.tv_usec << 32) / 1000000ULL));
+
+    if (sendto(fd, req, sizeof(req), 0, res->ai_addr, res->ai_addrlen) !=
+        (ssize_t)sizeof(req)) {
+      err = "sendto() failed";
+      continue;
+    }
+
+    /* Skip late replies to earlier samples: only ours echoes this nonce. */
+    for (int tries = 0; tries < 4; tries++) {
+      n = recvfrom(fd, rsp, sizeof(rsp), 0, NULL, NULL);
+      if (n < (ssize_t)sizeof(rsp) || !memcmp(&rsp[24], &req[40], 8)) break;
+      n = -1;
+    }
+    gettimeofday(&tv, NULL);
+    t4 = usec_of(&tv);
+
+    if (n < (ssize_t)sizeof(rsp)) {
+      err = "no reply (timeout)";
+      continue;
+    }
+    if ((rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 || rsp[1] == 0) {
+      err = "server unsynchronized or kiss-o'-death";
+      break; /* asked us to back off */
+    }
+    if (get_be32(&rsp[40]) == 0) {
+      err = "empty transmit timestamp";
+      continue;
+    }
+
+    t3 = ntp_to_unix_us(&rsp[40]);
+    t2 = get_be32(&rsp[32]) ? ntp_to_unix_us(&rsp[32]) : t3;
+    if (t3 < MIN_SANE_UNIX * 1000000LL || t2 > t3) {
+      err = "implausible time from server";
+      continue;
+    }
+
+    int64_t offset = ((t2 - t1) + (t3 - t4)) / 2;
+    int64_t delay = (t4 - t1) - (t3 - t2);
+    if (delay < 0) delay = 0;
+    logmsg("  sample %d: offset %+lld.%03lld ms, delay %lld.%03lld ms", i + 1,
+           (long long)(offset / 1000), (long long)llabs(offset % 1000),
+           (long long)(delay / 1000), (long long)(delay % 1000));
+    if (!*good || delay < *delay_us) {
+      *offset_us = offset;
+      *delay_us = delay;
+    }
+    (*good)++;
   }
 
-  n = recvfrom(fd, rsp, sizeof(rsp), 0, NULL, NULL);
-  gettimeofday(&t4, NULL);
   close(fd);
   freeaddrinfo(res);
-
-  if (n < (ssize_t)sizeof(rsp))
-    return "no reply (timeout)";
-  if (memcmp(&rsp[24], &req[40], 8) != 0)
-    return "reply does not match request";
-  if ((rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 || rsp[1] == 0)
-    return "server unsynchronized or kiss-o'-death";
-
-  uint32_t secs = get_be32(&rsp[40]);
-  uint32_t frac = get_be32(&rsp[44]);
-  if (secs == 0)
-    return "empty transmit timestamp";
-
-  /* NTP era 0 ends in 2036; values below the 1970 offset mean era 1. */
-  int64_t unix_s = (secs >= NTP_UNIX_DELTA)
-                       ? (int64_t)secs - (int64_t)NTP_UNIX_DELTA
-                       : (int64_t)secs + (1LL << 32) - (int64_t)NTP_UNIX_DELTA;
-  int64_t us = (int64_t)(((uint64_t)frac * 1000000ULL) >> 32);
-
-  /* Compensate for network delay: assume symmetric path. */
-  int64_t rtt = usec_of(&t4) - usec_of(&t1);
-  us += rtt / 2;
-  unix_s += us / 1000000;
-  us %= 1000000;
-
-  if (unix_s < MIN_SANE_UNIX)
-    return "implausible time from server";
-
-  out->tv_sec = (time_t)unix_s;
-  out->tv_usec = (suseconds_t)us;
-  *rtt_us = rtt;
-  return NULL;
+  return *good ? NULL : err;
 }
 #endif
 
@@ -418,7 +509,7 @@ static void scan_file(const char *path, scan_result_t *r) {
   r->files++;
   switch (etahen_scan_file(path, &d)) {
   case ETAHEN_EXPIRES:
-    printf("[" TAG "] %s: etaHEN beta, expires %04d-%02d-%02d\n", path,
+    logmsg("%s: etaHEN beta, expires %04d-%02d-%02d", path,
            d.year, d.month, d.day);
     if (!r->betas || days_from_civil(d.year, d.month, d.day) <
                          days_from_civil(r->expiry.year, r->expiry.month,
@@ -429,7 +520,7 @@ static void scan_file(const char *path, scan_result_t *r) {
     r->betas++;
     break;
   case ETAHEN_NO_EXPIRY:
-    printf("[" TAG "] %s: etaHEN, no expiry\n", path);
+    logmsg("%s: etaHEN, no expiry", path);
     r->full_releases++;
     break;
   }
@@ -530,6 +621,7 @@ int main(void) {
   scan_result_t r;
   time_t fallback;
 
+  log_open();
   load_config();
   if (parse_date(cfg.unsync_date, &fallback) != 0) {
     fail("FAILED: bad unsync_date \"%s\" (edit " CONF_PATH ")",
@@ -551,7 +643,7 @@ int main(void) {
                              86400);
     snprintf(why, sizeof(why), " (etaHEN beta expires %04d-%02d-%02d)",
              r.expiry.year, r.expiry.month, r.expiry.day);
-    printf("[" TAG "] using %s\n", r.beta_path);
+    logmsg("using %s", r.beta_path);
     if (time(NULL) < target) {
       say("etaHEN beta expires %04d-%02d-%02d, not yet - clock unchanged",
           r.expiry.year, r.expiry.month, r.expiry.day);
@@ -567,8 +659,8 @@ int main(void) {
 }
 #else
 /* Try each configured server once. Returns the one that answered. */
-static const char *try_servers(char *list, size_t len, struct timeval *set,
-                               int64_t *rtt, const char **err) {
+static const char *try_servers(char *list, size_t len, int64_t *offset,
+                               int64_t *delay, int *good, const char **err) {
   char *tok, *save = NULL;
   int tried = 0;
 
@@ -579,10 +671,10 @@ static const char *try_servers(char *list, size_t len, struct timeval *set,
     char *server = trim(tok);
     if (!*server) continue;
     tried++;
-    printf("[" TAG "] querying %s\n", server);
-    if (!(*err = sntp_query(server, set, rtt)))
+    logmsg("querying %s", server);
+    if (!(*err = sntp_query(server, offset, delay, good)))
       return server;
-    printf("[" TAG "] %s: %s\n", server, *err);
+    logmsg("%s: %s", server, *err);
   }
   return NULL;
 }
@@ -626,91 +718,125 @@ static void stamp_check(time_t now) {
 /* Fetch the latest release tag over HTTPS with the system's own network
  * libraries. They are loaded at run time, so a console where they are
  * unavailable just skips the check instead of failing to load the ELF. */
+/* System libraries by name, falling back to their full path. */
+static void *open_lib(const char *name) {
+  char path[128];
+  void *h = dlopen(name, RTLD_LAZY);
+
+  if (!h) {
+    logmsg("update check: dlopen %s: %s", name, dlerror());
+    snprintf(path, sizeof(path), "/system/common/lib/%s", name);
+    if (!(h = dlopen(path, RTLD_LAZY)))
+      logmsg("update check: dlopen %s: %s", path, dlerror());
+  }
+  return h;
+}
+
+/* sceHttp asks this whether to accept the server's certificate chain.
+ * Some firmwares (seen on 12.40) don't know GitHub's CA and would refuse
+ * it (SCE_SSL_ERROR_UNKNOWN_CA), so accept it, as ps5-payload-dev's
+ * elfldr does. We only read a version number; nothing is downloaded. */
+static int accept_cert(void) { return 0; }
+
+/* Fetch the latest release tag over HTTPS with the system's libSceHttp,
+ * following the same calls as ps5-payload-dev/elfldr (uri.c). The
+ * libraries are loaded at run time, so a console where they are missing
+ * just skips the check instead of failing to load the ELF. */
 static int fetch_latest_tag(char *tag, size_t len) {
   int (*NetInit)(void);
   int (*NetPoolCreate)(const char *, int, int);
   int (*NetPoolDestroy)(int);
   int (*SslInit)(size_t);
   int (*SslTerm)(int);
-  int (*H2Init)(int, int, size_t, int);
-  int (*H2Term)(int);
-  int (*H2CreateTemplate)(int, const char *, int, int);
-  int (*H2DeleteTemplate)(int);
-  int (*H2CreateRequestWithURL)(int, const char *, const char *, uint64_t);
-  int (*H2DeleteRequest)(int);
-  int (*H2AddRequestHeader)(int, const char *, const char *, int);
-  int (*H2SetResolveTimeOut)(int, uint32_t);
-  int (*H2SetConnectTimeOut)(int, uint32_t);
-  int (*H2SetRecvTimeOut)(int, uint32_t);
-  int (*H2SendRequest)(int, const void *, size_t);
-  int (*H2GetStatusCode)(int, int *);
-  int (*H2ReadData)(int, void *, size_t);
+  int (*HttpInit)(int, int, size_t);
+  int (*HttpTerm)(int);
+  int (*CreateTemplate)(int, const char *, int, int);
+  int (*SetSslCallback)(int, void *, void *);
+  int (*SetResponseHeaderMaxSize)(int, size_t);
+  int (*DeleteTemplate)(int);
+  int (*CreateConnectionWithURL)(int, const char *, int);
+  int (*DeleteConnection)(int);
+  int (*CreateRequestWithURL)(int, int, const char *, uint64_t);
+  int (*DeleteRequest)(int);
+  int (*SendRequest)(int, const void *, size_t);
+  int (*GetStatusCode)(int, int *);
+  int (*ReadData)(int, void *, size_t);
+  static const char url[] =
+      "https://api.github.com/repos/" UPDATE_REPO "/releases/latest";
   void *net, *ssl, *http;
-  int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, req = -1, status = 0;
-  int rc = -1;
+  int pool = -1, sslctx = -1, ctx = -1, tmpl = -1, conn = -1, req = -1;
+  int status = 0, rc = -1;
   static char body[32 * 1024];
   size_t got = 0;
 
-  net = dlopen("libSceNet.sprx", RTLD_LAZY);
-  ssl = dlopen("libSceSsl.sprx", RTLD_LAZY);
-  http = dlopen("libSceHttp2.sprx", RTLD_LAZY);
-  if (!net || !ssl || !http) {
-    printf("[" TAG "] update check: cannot load network libraries\n");
-    goto out;
-  }
+  net = open_lib("libSceNet.sprx");
+  ssl = open_lib("libSceSsl.sprx");
+  http = open_lib("libSceHttp.sprx");
+  if (!net || !ssl || !http) goto out;
 
-#define SYM(var, lib, name) \
-  if (!(*(void **)&var = dlsym(lib, name))) goto out
+#define SYM(var, lib, name)                                    \
+  if (!(*(void **)&var = dlsym(lib, name))) {                  \
+    logmsg("update check: %s not found: %s", name, dlerror()); \
+    goto out;                                                  \
+  }
   SYM(NetInit, net, "sceNetInit");
   SYM(NetPoolCreate, net, "sceNetPoolCreate");
   SYM(NetPoolDestroy, net, "sceNetPoolDestroy");
   SYM(SslInit, ssl, "sceSslInit");
   SYM(SslTerm, ssl, "sceSslTerm");
-  SYM(H2Init, http, "sceHttp2Init");
-  SYM(H2Term, http, "sceHttp2Term");
-  SYM(H2CreateTemplate, http, "sceHttp2CreateTemplate");
-  SYM(H2DeleteTemplate, http, "sceHttp2DeleteTemplate");
-  SYM(H2CreateRequestWithURL, http, "sceHttp2CreateRequestWithURL");
-  SYM(H2DeleteRequest, http, "sceHttp2DeleteRequest");
-  SYM(H2AddRequestHeader, http, "sceHttp2AddRequestHeader");
-  SYM(H2SetResolveTimeOut, http, "sceHttp2SetResolveTimeOut");
-  SYM(H2SetConnectTimeOut, http, "sceHttp2SetConnectTimeOut");
-  SYM(H2SetRecvTimeOut, http, "sceHttp2SetRecvTimeOut");
-  SYM(H2SendRequest, http, "sceHttp2SendRequest");
-  SYM(H2GetStatusCode, http, "sceHttp2GetStatusCode");
-  SYM(H2ReadData, http, "sceHttp2ReadData");
+  SYM(HttpInit, http, "sceHttpInit");
+  SYM(HttpTerm, http, "sceHttpTerm");
+  SYM(CreateTemplate, http, "sceHttpCreateTemplate");
+  SYM(SetSslCallback, http, "sceHttpsSetSslCallback");
+  SYM(SetResponseHeaderMaxSize, http, "sceHttpSetResponseHeaderMaxSize");
+  SYM(DeleteTemplate, http, "sceHttpDeleteTemplate");
+  SYM(CreateConnectionWithURL, http, "sceHttpCreateConnectionWithURL");
+  SYM(DeleteConnection, http, "sceHttpDeleteConnection");
+  SYM(CreateRequestWithURL, http, "sceHttpCreateRequestWithURL");
+  SYM(DeleteRequest, http, "sceHttpDeleteRequest");
+  SYM(SendRequest, http, "sceHttpSendRequest");
+  SYM(GetStatusCode, http, "sceHttpGetStatusCode");
+  SYM(ReadData, http, "sceHttpReadData");
 #undef SYM
 
-  NetInit();
-  if ((pool = NetPoolCreate(TAG, 32 * 1024, 0)) < 0) goto out;
-  if ((sslctx = SslInit(256 * 1024)) < 0) goto out;
-  if ((ctx = H2Init(pool, sslctx, 256 * 1024, 1)) < 0) goto out;
-  if ((tmpl = H2CreateTemplate(ctx, TAG "/" VERSION, 3, 1)) < 0) goto out;
-  if ((req = H2CreateRequestWithURL(
-           tmpl, "GET",
-           "https://api.github.com/repos/" UPDATE_REPO "/releases/latest",
-           0)) < 0)
-    goto out;
-  H2AddRequestHeader(req, "Accept", "application/vnd.github+json", 0);
-  H2SetResolveTimeOut(req, UPDATE_TIMEOUT_US);
-  H2SetConnectTimeOut(req, UPDATE_TIMEOUT_US);
-  H2SetRecvTimeOut(req, UPDATE_TIMEOUT_US);
+  /* Each step logs its return value (0x8... codes are SCE errors). The
+   * line is written before the next call, so if the payload ever dies
+   * the last log line shows where. */
+#define STEP(expr, what)                                       \
+  do {                                                         \
+    int r_ = (expr);                                           \
+    logmsg("update check: %s = 0x%08x", what, (unsigned)r_);   \
+    if (r_ < 0) goto out;                                      \
+  } while (0)
+  logmsg("update check: sceNetInit = 0x%08x (errors here are harmless)",
+         (unsigned)NetInit());
+  STEP(pool = NetPoolCreate(TAG, 16 * 1024, 0), "sceNetPoolCreate");
+  STEP(sslctx = SslInit(128 * 1024), "sceSslInit");
+  STEP(ctx = HttpInit(pool, sslctx, 32 * 1024), "sceHttpInit");
+  STEP(tmpl = CreateTemplate(ctx, TAG "/" VERSION, 2, 1),
+       "sceHttpCreateTemplate");
+  STEP(SetResponseHeaderMaxSize(tmpl, 0x2000),
+       "sceHttpSetResponseHeaderMaxSize");
+  STEP(SetSslCallback(tmpl, (void *)accept_cert, NULL),
+       "sceHttpsSetSslCallback");
+  STEP(conn = CreateConnectionWithURL(tmpl, url, 0),
+       "sceHttpCreateConnectionWithURL");
+  STEP(req = CreateRequestWithURL(conn, 0 /* GET */, url, 0),
+       "sceHttpCreateRequestWithURL");
+  STEP(SendRequest(req, NULL, 0), "sceHttpSendRequest");
+  STEP(GetStatusCode(req, &status), "sceHttpGetStatusCode");
+#undef STEP
+  logmsg("update check: HTTP status %d", status);
+  if (status != 200) goto out;
 
-  if (H2SendRequest(req, NULL, 0) || H2GetStatusCode(req, &status)) {
-    printf("[" TAG "] update check: request failed\n");
-    goto out;
-  }
-  if (status != 200) {
-    printf("[" TAG "] update check: HTTP %d\n", status);
-    goto out;
-  }
   for (;;) {
-    int n = H2ReadData(req, body + got, sizeof(body) - 1 - got);
+    int n = ReadData(req, body + got, sizeof(body) - 1 - got);
     if (n <= 0) break;
     got += n;
     if (got >= sizeof(body) - 1) break;
   }
   body[got] = 0;
+  logmsg("update check: read %u bytes", (unsigned)got);
 
   /* Minimal JSON lookup: "tag_name": "v1.2" */
   char *p = strstr(body, "\"tag_name\"");
@@ -720,11 +846,13 @@ static int fetch_latest_tag(char *tag, size_t len) {
     tag[i] = 0;
     rc = i ? 0 : -1;
   }
+  if (rc != 0) logmsg("update check: no tag_name in reply: %.120s", body);
 
 out:
-  if (req >= 0) H2DeleteRequest(req);
-  if (tmpl >= 0) H2DeleteTemplate(tmpl);
-  if (ctx >= 0) H2Term(ctx);
+  if (req >= 0) DeleteRequest(req);
+  if (conn >= 0) DeleteConnection(conn);
+  if (tmpl >= 0) DeleteTemplate(tmpl);
+  if (ctx >= 0) HttpTerm(ctx);
   if (sslctx >= 0) SslTerm(sslctx);
   if (pool >= 0) NetPoolDestroy(pool);
   if (http) dlclose(http);
@@ -737,13 +865,22 @@ static void check_for_update(void) {
   char latest[64];
   time_t now = time(NULL);
 
-  if (!cfg.update_check || !strcmp(VERSION, "dev") || checked_recently(now))
+  if (!cfg.update_check || !strcmp(VERSION, "dev")) {
+    logmsg("update check: off (update_check = off, or a dev build)");
     return;
-  if (fetch_latest_tag(latest, sizeof(latest)) != 0)
-    return; /* try again on the next run */
+  }
+  if (checked_recently(now)) {
+    logmsg("update check: already done in the last 24 h (" STAMP_PATH ")");
+    return;
+  }
+  logmsg("update check: asking GitHub for the latest release");
+  if (fetch_latest_tag(latest, sizeof(latest)) != 0) {
+    logmsg("update check: failed, will retry on the next run");
+    return;
+  }
   stamp_check(now);
 
-  printf("[" TAG "] running " VERSION ", latest is %s\n", latest);
+  logmsg("running " VERSION ", latest is %s", latest);
   if (version_newer(latest, VERSION) && cfg.notify) {
     notify_request_t req;
     memset(&req, 0, sizeof(req));
@@ -752,6 +889,7 @@ static void check_for_update(void) {
                  ") - github.com/" UPDATE_REPO "/releases",
              latest);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+    logmsg("update check: notified about %s", latest);
   }
 }
 
@@ -765,30 +903,100 @@ static void wait_for_etahen(void) {
   if (stat(UNSYNCED_PATH, &st) != 0 || cfg.etahen_wait <= 0) return;
   while (stat(ETAHEN_SOCKET, &st) != 0 && waited < cfg.etahen_wait) {
     if (waited == 0)
-      printf("[" TAG "] waiting up to %ds for etaHEN to start\n",
+      logmsg("waiting up to %ds for etaHEN to start",
              cfg.etahen_wait);
     sleep(1);
     waited++;
   }
   if (waited >= cfg.etahen_wait)
-    printf("[" TAG "] etaHEN not detected, syncing anyway\n");
+    logmsg("etaHEN not detected, syncing anyway");
+}
+
+/* Payload Manager (github.com/itsPLK/ps5-payload-manager) keeps its
+ * repository sources in /data/pldmgr/sources.json as
+ *   {"sources":[{"id":..,"name":..,"url":..,"removable":true}, ...]}
+ * and re-reads it on every request. Add ours once; the marker file keeps a
+ * source the user removed from coming back. */
+static void add_pldmgr_source(void) {
+  static const char entry[] =
+      "  {\"id\":\"source_ps5timesync\",\"name\":\"ps5-time-sync\","
+      "\"url\":\"" PLDMGR_SOURCE_URL "\",\"removable\":true}\n";
+  struct stat st;
+  char *json = NULL, *close_br;
+  long size = 0;
+  FILE *f;
+
+  if (!cfg.pldmgr_source || !strcmp(VERSION, "dev")) return;
+  if (stat(PLDMGR_MARKER, &st) == 0) return;
+  if (stat(PLDMGR_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+  if ((f = fopen(PLDMGR_SOURCES, "r"))) {
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size > 0 && size < 256 * 1024 && (json = malloc(size + 1))) {
+      size = (long)fread(json, 1, size, f);
+      json[size] = 0;
+    }
+    fclose(f);
+  }
+
+  if (json && strstr(json, UPDATE_REPO "/releases")) {
+    logmsg("Payload Manager already lists this repository");
+  } else {
+    char tmp[] = PLDMGR_SOURCES ".tmp";
+    if (!(f = fopen(tmp, "w"))) {
+      logmsg("Payload Manager: cannot write %s", tmp);
+      free(json);
+      return;
+    }
+    if (json && strstr(json, "\"sources\"") &&
+        (close_br = strrchr(json, ']')) && strchr(json, '[') < close_br) {
+      /* Insert before the closing bracket; add a comma after the last
+       * existing entry if there is one. */
+      char *last = close_br;
+      while (last > json && (last[-1] == ' ' || last[-1] == '\n' ||
+                             last[-1] == '\r' || last[-1] == '\t'))
+        last--;
+      fwrite(json, 1, last - json, f);
+      fputs(last[-1] == '}' ? ",\n" : "\n", f);
+      fputs(entry, f);
+      fputs(close_br, f);
+    } else {
+      fputs("{\"sources\":[\n", f);
+      fputs(entry, f);
+      fputs("]}\n", f);
+    }
+    fclose(f);
+    if (rename(tmp, PLDMGR_SOURCES) != 0) {
+      logmsg("Payload Manager: cannot replace %s", PLDMGR_SOURCES);
+      unlink(tmp);
+      free(json);
+      return;
+    }
+    say("added to Payload Manager sources - updates show up there");
+  }
+  free(json);
+  if ((f = fopen(PLDMGR_MARKER, "w"))) fclose(f);
 }
 
 static int sync_main(void) {
   char list[sizeof(cfg.servers)], suffix[160];
   struct timeval set;
   const char *err, *used;
-  int64_t rtt = 0;
-  int waited = 0;
+  int64_t offset = 0, delay = 0, now_us;
+  int good = 0, waited = 0;
 
+  log_open();
   load_config();
   wait_for_etahen();
 
   /* The clock may have just been moved by time-unsync, so measure the
    * retry window with sleep() counts rather than wall-clock time. */
-  while (!(used = try_servers(list, sizeof(list), &set, &rtt, &err)) &&
+  while (!(used = try_servers(list, sizeof(list), &offset, &delay, &good,
+                              &err)) &&
          waited + RETRY_PAUSE_SEC <= cfg.retry_for) {
-    printf("[" TAG "] retrying in %ds\n", RETRY_PAUSE_SEC);
+    logmsg("retrying in %ds", RETRY_PAUSE_SEC);
     sleep(RETRY_PAUSE_SEC);
     waited += RETRY_PAUSE_SEC;
   }
@@ -797,17 +1005,29 @@ static int sync_main(void) {
     fail("FAILED: %s (edit " CONF_PATH ")", err);
     return 1;
   }
+
+  /* Apply the offset to the clock as it is right now, so time spent since
+   * the measurement doesn't count as error. */
+  gettimeofday(&set, NULL);
+  now_us = usec_of(&set) + offset;
+  set.tv_sec = (time_t)(now_us / 1000000);
+  set.tv_usec = (suseconds_t)(now_us % 1000000);
   if (set_clock(&set) != 0) {
     fail("FAILED: kernel refused to set the clock (privileges?)");
     return 1;
   }
-  snprintf(suffix, sizeof(suffix), " via %s (rtt %lld ms)", used,
-           (long long)(rtt / 1000));
+  logmsg("corrected by %+lld.%03lld ms (best of %d samples, delay %lld ms, "
+         "accurate to about +-%lld ms)",
+         (long long)(offset / 1000), (long long)llabs(offset % 1000), good,
+         (long long)(delay / 1000), (long long)(delay / 2000));
+  snprintf(suffix, sizeof(suffix), " via %s (+-%lld ms)", used,
+           (long long)(delay / 2000));
   report_clock(suffix);
   unlink(UNSYNCED_PATH);
 
   /* Only after the clock is right: HTTPS certificates need it. */
   check_for_update();
+  add_pldmgr_source();
   return 0;
 }
 
