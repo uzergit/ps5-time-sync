@@ -259,7 +259,14 @@ Builds made outside a release (version `dev`) never check.
 
 If you use [PS5 Payload Manager](https://github.com/itsPLK/ps5-payload-manager),
 add this project as a source and it will offer **Install** and **Update**
-buttons for both payloads:
+buttons for both payloads.
+
+**time-sync does this for you:** after its first successful sync it adds the
+source below to Payload Manager (`/data/pldmgr/sources.json`) and shows
+"added to Payload Manager sources". It only does this once, so if you remove
+the source it stays removed. Turn it off with `pldmgr_source = off`.
+
+To add it by hand instead:
 
 1. Open Payload Manager → **Settings** (gear icon) → **Manage Sources**.
 2. Tap **Add Source** and enter:
@@ -268,6 +275,11 @@ buttons for both payloads:
    ```
 3. Both payloads appear under **ps5-time-sync** in the Storage Hub. When a
    new release comes out, they show an **Update** button.
+
+Payload Manager installs updates into its own folder,
+`/data/pldmgr/payloads/time-sync/time-sync_<version>.elf`. A copy you
+uploaded yourself (e.g. `/data/pldmgr/payloads/time-sync.elf`) stays where it
+is; delete it once you use the updated one.
 
 Every release includes this `payloads.json`. It lists the files with the
 version in their names (for example `time-sync_v1.4.elf`), because Payload

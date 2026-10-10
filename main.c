@@ -54,6 +54,11 @@
 #define CONF_DIR        "/data/timesyncer"
 #define CONF_PATH       CONF_DIR "/config.ini"
 #define STAMP_PATH      CONF_DIR "/last_update_check"
+#define PLDMGR_DIR      "/data/pldmgr"
+#define PLDMGR_SOURCES  PLDMGR_DIR "/sources.json"
+#define PLDMGR_MARKER   CONF_DIR "/pldmgr_source_added"
+#define PLDMGR_SOURCE_URL \
+  "https://github.com/" UPDATE_REPO "/releases/latest/download/payloads.json"
 #define UNSYNCED_PATH   CONF_DIR "/unsynced" /* time-unsync moved the clock */
 #define ETAHEN_SOCKET   "/system_tmp/etaHEN_crit_service"
 #define EXPIRY_MARGIN_DAYS 2 /* covers the console's time zone offset */
@@ -83,6 +88,7 @@ typedef struct {
   char etahen_path[512]; /* extra files/folders to scan first (unsync) */
   int etahen_wait;   /* seconds to wait for etaHEN before syncing (sync) */
   int samples;       /* NTP measurements per server, best one wins (sync) */
+  int pldmgr_source; /* add our repository to Payload Manager once (sync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -102,6 +108,7 @@ static config_t cfg = {.servers = NTP_SERVER,
                        .unsync_auto = 1,
                        .etahen_wait = 60,
                        .samples = 4,
+                       .pldmgr_source = 1,
                        .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
@@ -133,6 +140,10 @@ static const char default_ini[] =
     "; After syncing, check GitHub (at most once a day) for a newer\n"
     "; release and show a notification if there is one: on, off\n"
     "update_check = on\n"
+    "\n"
+    "; If PS5 Payload Manager is installed, add this project's repository\n"
+    "; to its sources once, so it offers Update buttons: on, off\n"
+    "pldmgr_source = on\n"
     "\n"
     "; If time-unsync moved the clock, wait up to this many seconds\n"
     "; for etaHEN to finish starting before syncing (0 = don't wait).\n"
@@ -268,6 +279,9 @@ static void load_config(void) {
       else if (!strcasecmp(v, "auto")) cfg.unsync_auto = 1;
     } else if (!strcasecmp(k, "etahen_path")) {
       snprintf(cfg.etahen_path, sizeof(cfg.etahen_path), "%s", v);
+    } else if (!strcasecmp(k, "pldmgr_source")) {
+      if (!strcasecmp(v, "off") || !strcmp(v, "0")) cfg.pldmgr_source = 0;
+      else if (!strcasecmp(v, "on") || !strcmp(v, "1")) cfg.pldmgr_source = 1;
     } else if (!strcasecmp(k, "samples")) {
       cfg.samples = parse_int(v, 1, 8, cfg.samples);
     } else if (!strcasecmp(k, "etahen_wait")) {
@@ -898,6 +912,74 @@ static void wait_for_etahen(void) {
     logmsg("etaHEN not detected, syncing anyway");
 }
 
+/* Payload Manager (github.com/itsPLK/ps5-payload-manager) keeps its
+ * repository sources in /data/pldmgr/sources.json as
+ *   {"sources":[{"id":..,"name":..,"url":..,"removable":true}, ...]}
+ * and re-reads it on every request. Add ours once; the marker file keeps a
+ * source the user removed from coming back. */
+static void add_pldmgr_source(void) {
+  static const char entry[] =
+      "  {\"id\":\"source_ps5timesync\",\"name\":\"ps5-time-sync\","
+      "\"url\":\"" PLDMGR_SOURCE_URL "\",\"removable\":true}\n";
+  struct stat st;
+  char *json = NULL, *close_br;
+  long size = 0;
+  FILE *f;
+
+  if (!cfg.pldmgr_source || !strcmp(VERSION, "dev")) return;
+  if (stat(PLDMGR_MARKER, &st) == 0) return;
+  if (stat(PLDMGR_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+  if ((f = fopen(PLDMGR_SOURCES, "r"))) {
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size > 0 && size < 256 * 1024 && (json = malloc(size + 1))) {
+      size = (long)fread(json, 1, size, f);
+      json[size] = 0;
+    }
+    fclose(f);
+  }
+
+  if (json && strstr(json, UPDATE_REPO "/releases")) {
+    logmsg("Payload Manager already lists this repository");
+  } else {
+    char tmp[] = PLDMGR_SOURCES ".tmp";
+    if (!(f = fopen(tmp, "w"))) {
+      logmsg("Payload Manager: cannot write %s", tmp);
+      free(json);
+      return;
+    }
+    if (json && strstr(json, "\"sources\"") &&
+        (close_br = strrchr(json, ']')) && strchr(json, '[') < close_br) {
+      /* Insert before the closing bracket; add a comma after the last
+       * existing entry if there is one. */
+      char *last = close_br;
+      while (last > json && (last[-1] == ' ' || last[-1] == '\n' ||
+                             last[-1] == '\r' || last[-1] == '\t'))
+        last--;
+      fwrite(json, 1, last - json, f);
+      fputs(last[-1] == '}' ? ",\n" : "\n", f);
+      fputs(entry, f);
+      fputs(close_br, f);
+    } else {
+      fputs("{\"sources\":[\n", f);
+      fputs(entry, f);
+      fputs("]}\n", f);
+    }
+    fclose(f);
+    if (rename(tmp, PLDMGR_SOURCES) != 0) {
+      logmsg("Payload Manager: cannot replace %s", PLDMGR_SOURCES);
+      unlink(tmp);
+      free(json);
+      return;
+    }
+    say("added to Payload Manager sources - updates show up there");
+  }
+  free(json);
+  if ((f = fopen(PLDMGR_MARKER, "w"))) fclose(f);
+}
+
 static int sync_main(void) {
   char list[sizeof(cfg.servers)], suffix[160];
   struct timeval set;
@@ -945,6 +1027,7 @@ static int sync_main(void) {
 
   /* Only after the clock is right: HTTPS certificates need it. */
   check_for_update();
+  add_pldmgr_source();
   return 0;
 }
 
