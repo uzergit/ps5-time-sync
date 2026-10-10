@@ -1,3 +1,4 @@
+Utility was fully coded by our scene's beloved Claude ❤️
 # ps5-time-sync
 
 `time-sync.elf` is a small payload for a **jailbroken** PS5 that sets the
