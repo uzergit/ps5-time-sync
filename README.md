@@ -255,6 +255,27 @@ time-sync: update v1.3 available (you have v1.2) - github.com/uzergit/ps5-time-s
 
 Builds made outside a release (version `dev`) never check.
 
+## Payload Manager: install and update from the app
+
+If you use [PS5 Payload Manager](https://github.com/itsPLK/ps5-payload-manager),
+add this project as a source and it will offer **Install** and **Update**
+buttons for both payloads:
+
+1. Open Payload Manager → **Settings** (gear icon) → **Manage Sources**.
+2. Tap **Add Source** and enter:
+   ```
+   https://github.com/uzergit/ps5-time-sync/releases/latest/download/payloads.json
+   ```
+3. Both payloads appear under **ps5-time-sync** in the Storage Hub. When a
+   new release comes out, they show an **Update** button.
+
+Every release includes this `payloads.json`. It lists the files with the
+version in their names (for example `time-sync_v1.4.elf`), because Payload
+Manager compares file names to spot updates, and with SHA-256 checksums,
+which Payload Manager checks after downloading. After an update the file on
+your console has the new versioned name, so if an autoloader list refers to
+the payload by name, update the name there too.
+
 ## Logs
 
 Both payloads write what they did to `/data/timesyncer/time-sync.log` and
