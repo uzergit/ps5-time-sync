@@ -19,7 +19,9 @@ and sets the clock to just before that date. See
 2. Tries each NTP server from the config in order, until one answers. If none
    answers, it keeps retrying for up to `retry_for` seconds (30 by default),
    for example while the network is still coming up at boot.
-3. Sets the system clock with `settimeofday()` (UTC).
+3. Measures how far off the console clock is, using several samples (see
+   [How accurate is it?](#how-accurate-is-it)), and corrects it with
+   `settimeofday()` (UTC).
 4. Shows a notification on the PS5: `time-sync: OK <date> UTC via <server>` or
    `time-sync: FAILED: <reason>`.
 
@@ -164,6 +166,8 @@ servers = time.apple.com, time.cloudflare.com, pool.ntp.org
 port = 123
 ; Seconds to wait for each server before trying the next.
 timeout = 2
+; Measurements per server (1-8); the one with the least network delay is used
+samples = 4
 ; time-sync keeps retrying for this many seconds if no server answers.
 retry_for = 30
 ; On-screen notifications: all, errors, off
@@ -193,6 +197,35 @@ are ignored, and the defaults are used for them.
 You can also change the built-in default servers at build time:
 `make NTP_SERVER="192.168.1.1"`.
 
+## How accurate is it?
+
+time-sync uses the standard NTP calculation. Every reply carries four
+timestamps: when the PS5 sent the request, when the server received it,
+when the server answered, and when the PS5 got the answer. From those it
+works out the clock offset with the server's own processing time cancelled
+out and the network delay split evenly between both directions.
+
+The remaining error comes from the network being faster in one direction
+than the other, and it can be at most half the round-trip delay. That delay
+changes from packet to packet, so time-sync takes `samples` measurements
+(4 by default, 0.25 s apart) and uses the one with the shortest delay. It
+then adds the measured offset to the console clock at the moment of setting
+it, so the time spent measuring doesn't count either.
+
+The log (`/data/timesyncer/time-sync.log`) shows every sample and the
+result, for example:
+
+```
+  sample 1: offset +1532.481 ms, delay 48.210 ms
+  sample 2: offset +1510.902 ms, delay 22.731 ms
+corrected by +1510.902 ms (best of 4 samples, delay 22 ms, accurate to about +-11 ms)
+```
+
+On a typical home connection that means the clock ends up within a few
+milliseconds of the server. Absolute zero isn't possible over a network,
+and the PS5's hardware clock probably only stores whole seconds, so after a
+reboot the sub-second part may be lost until the next sync.
+
 ## Update notifications
 
 After a successful sync, `time-sync.elf` asks GitHub for the newest release
@@ -211,11 +244,27 @@ time-sync: update v1.3 available (you have v1.2) - github.com/uzergit/ps5-time-s
 - It uses the PS5's own HTTPS libraries and only talks to `api.github.com`.
   If those libraries can't be loaded, the check is skipped and the time sync
   still works.
+- Some firmwares (seen on 12.40) don't recognise the authority behind
+  GitHub's certificate. In that case the check retries without that
+  certificate check. That's acceptable here because it only reads a version
+  number; a forged reply could at worst show a wrong "update available"
+  notification.
 - It doesn't download or install anything: you update by grabbing the new
   `.elf` from the Releases page.
 - Turn it off with `update_check = off` in `config.ini`.
 
 Builds made outside a release (version `dev`) never check.
+
+## Logs
+
+Both payloads write what they did to `/data/timesyncer/time-sync.log` and
+`/data/timesyncer/time-unsync.log` (replaced on every run): servers tried,
+samples, the etaHEN files found, and each step of the update check with its
+error code. Fetch them over FTP when something doesn't work, for example:
+
+```sh
+curl ftp://<PS5-IP>:1337/data/timesyncer/time-sync.log
+```
 
 ## Building locally
 

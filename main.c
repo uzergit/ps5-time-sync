@@ -66,6 +66,7 @@
 #define MIN_SANE_UNIX   1577836800LL  /* 2020-01-01: reject garbage */
 #define MAX_SERVERS     8
 #define RETRY_PAUSE_SEC 3
+#define SAMPLE_GAP_US   250000 /* between samples; polite to the server */
 
 #ifdef UNSYNC
 #define TAG "time-unsync"
@@ -84,6 +85,7 @@ typedef struct {
   int unsync_auto;   /* read the date from etaHEN payloads (unsync) */
   char etahen_path[512]; /* extra files/folders to scan first (unsync) */
   int etahen_wait;   /* seconds to wait for etaHEN before syncing (sync) */
+  int samples;       /* NTP measurements per server, best one wins (sync) */
 } config_t;
 
 /* Notification toast (same layout used by ps5-payload-sdk samples). */
@@ -102,6 +104,7 @@ static config_t cfg = {.servers = NTP_SERVER,
                        .update_check = 1,
                        .unsync_auto = 1,
                        .etahen_wait = 60,
+                       .samples = 4,
                        .unsync_date = "2025-01-01 00:00:00"};
 
 static const char default_ini[] =
@@ -118,6 +121,10 @@ static const char default_ini[] =
     "\n"
     "; Seconds to wait for each server before trying the next.\n"
     "timeout = 2\n"
+    "\n"
+    "; Measurements per server (1-8). The one with the shortest network\n"
+    "; delay is used, which gives the most accurate time.\n"
+    "samples = 4\n"
     "\n"
     "; time-sync keeps retrying for this many seconds if no server\n"
     "; answers, e.g. while the network is still coming up at boot.\n"
@@ -264,6 +271,8 @@ static void load_config(void) {
       else if (!strcasecmp(v, "auto")) cfg.unsync_auto = 1;
     } else if (!strcasecmp(k, "etahen_path")) {
       snprintf(cfg.etahen_path, sizeof(cfg.etahen_path), "%s", v);
+    } else if (!strcasecmp(k, "samples")) {
+      cfg.samples = parse_int(v, 1, 8, cfg.samples);
     } else if (!strcasecmp(k, "etahen_wait")) {
       cfg.etahen_wait = parse_int(v, 0, 600, cfg.etahen_wait);
     } else if (!strcasecmp(k, "retry_for")) {
@@ -297,15 +306,39 @@ static int64_t usec_of(const struct timeval *tv) {
 
 /* Query one server. On success fills *out and *rtt_us and returns NULL,
  * otherwise returns a short reason. */
-static const char *sntp_query(const char *server, struct timeval *out,
-                              int64_t *rtt_us) {
+/* An NTP timestamp (seconds since 1900 + 32-bit fraction) in Unix
+ * microseconds. Era 0 ends in 2036; values below the 1970 offset are
+ * taken to be era 1. */
+static int64_t ntp_to_unix_us(const uint8_t *p) {
+  uint32_t secs = get_be32(p), frac = get_be32(p + 4);
+  int64_t unix_s = (secs >= NTP_UNIX_DELTA)
+                       ? (int64_t)secs - (int64_t)NTP_UNIX_DELTA
+                       : (int64_t)secs + (1LL << 32) - (int64_t)NTP_UNIX_DELTA;
+  return unix_s * 1000000LL + (int64_t)(((uint64_t)frac * 1000000ULL) >> 32);
+}
+
+/* Measure how far the local clock is from the server's, using the standard
+ * NTP on-wire calculation:
+ *
+ *   t1 = we send, t2 = server receives, t3 = server replies, t4 = we receive
+ *   offset = ((t2 - t1) + (t3 - t4)) / 2
+ *   delay  = (t4 - t1) - (t3 - t2)
+ *
+ * This cancels the server's own processing time and assumes only that the
+ * network path is equally slow in both directions. Network delay varies from
+ * packet to packet, and the error of a sample is at most half its delay, so
+ * we take several samples and keep the one with the smallest delay. On
+ * success returns NULL and fills *offset_us (add to the local clock),
+ * *delay_us and *good (samples used); otherwise a short reason. */
+static const char *sntp_query(const char *server, int64_t *offset_us,
+                              int64_t *delay_us, int *good) {
   char port[8];
   struct addrinfo hints, *res = NULL;
-  struct timeval tmo, t1, t4;
-  uint8_t req[48], rsp[48];
-  ssize_t n;
+  struct timeval tmo, tv;
+  const char *err = "no reply (timeout)";
   int fd;
 
+  *good = 0;
   snprintf(port, sizeof(port), "%d", cfg.port);
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
@@ -322,57 +355,73 @@ static const char *sntp_query(const char *server, struct timeval *out,
   tmo.tv_usec = 0;
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
 
-  /* LI=0, VN=4, Mode=3 (client). The transmit timestamp doubles as a
-   * nonce: the server must echo it back in its originate field. */
-  memset(req, 0, sizeof(req));
-  req[0] = (0 << 6) | (4 << 3) | 3;
-  gettimeofday(&t1, NULL);
-  put_be32(&req[40], (uint32_t)(t1.tv_sec + NTP_UNIX_DELTA));
-  put_be32(&req[44], (uint32_t)(((uint64_t)t1.tv_usec << 32) / 1000000ULL));
+  for (int i = 0; i < cfg.samples; i++) {
+    uint8_t req[48], rsp[48];
+    int64_t t1, t2, t3, t4;
+    ssize_t n = -1;
 
-  if (sendto(fd, req, sizeof(req), 0, res->ai_addr, res->ai_addrlen) !=
-      (ssize_t)sizeof(req)) {
-    close(fd);
-    freeaddrinfo(res);
-    return "sendto() failed";
+    if (i > 0) usleep(SAMPLE_GAP_US);
+
+    /* LI=0, VN=4, Mode=3 (client). The transmit timestamp doubles as a
+     * nonce: the server must echo it back in its originate field. */
+    memset(req, 0, sizeof(req));
+    req[0] = (0 << 6) | (4 << 3) | 3;
+    gettimeofday(&tv, NULL);
+    t1 = usec_of(&tv);
+    put_be32(&req[40], (uint32_t)(tv.tv_sec + NTP_UNIX_DELTA));
+    put_be32(&req[44], (uint32_t)(((uint64_t)tv.tv_usec << 32) / 1000000ULL));
+
+    if (sendto(fd, req, sizeof(req), 0, res->ai_addr, res->ai_addrlen) !=
+        (ssize_t)sizeof(req)) {
+      err = "sendto() failed";
+      continue;
+    }
+
+    /* Skip late replies to earlier samples: only ours echoes this nonce. */
+    for (int tries = 0; tries < 4; tries++) {
+      n = recvfrom(fd, rsp, sizeof(rsp), 0, NULL, NULL);
+      if (n < (ssize_t)sizeof(rsp) || !memcmp(&rsp[24], &req[40], 8)) break;
+      n = -1;
+    }
+    gettimeofday(&tv, NULL);
+    t4 = usec_of(&tv);
+
+    if (n < (ssize_t)sizeof(rsp)) {
+      err = "no reply (timeout)";
+      continue;
+    }
+    if ((rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 || rsp[1] == 0) {
+      err = "server unsynchronized or kiss-o'-death";
+      break; /* asked us to back off */
+    }
+    if (get_be32(&rsp[40]) == 0) {
+      err = "empty transmit timestamp";
+      continue;
+    }
+
+    t3 = ntp_to_unix_us(&rsp[40]);
+    t2 = get_be32(&rsp[32]) ? ntp_to_unix_us(&rsp[32]) : t3;
+    if (t3 < MIN_SANE_UNIX * 1000000LL || t2 > t3) {
+      err = "implausible time from server";
+      continue;
+    }
+
+    int64_t offset = ((t2 - t1) + (t3 - t4)) / 2;
+    int64_t delay = (t4 - t1) - (t3 - t2);
+    if (delay < 0) delay = 0;
+    logmsg("  sample %d: offset %+lld.%03lld ms, delay %lld.%03lld ms", i + 1,
+           (long long)(offset / 1000), (long long)llabs(offset % 1000),
+           (long long)(delay / 1000), (long long)(delay % 1000));
+    if (!*good || delay < *delay_us) {
+      *offset_us = offset;
+      *delay_us = delay;
+    }
+    (*good)++;
   }
 
-  n = recvfrom(fd, rsp, sizeof(rsp), 0, NULL, NULL);
-  gettimeofday(&t4, NULL);
   close(fd);
   freeaddrinfo(res);
-
-  if (n < (ssize_t)sizeof(rsp))
-    return "no reply (timeout)";
-  if (memcmp(&rsp[24], &req[40], 8) != 0)
-    return "reply does not match request";
-  if ((rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 || rsp[1] == 0)
-    return "server unsynchronized or kiss-o'-death";
-
-  uint32_t secs = get_be32(&rsp[40]);
-  uint32_t frac = get_be32(&rsp[44]);
-  if (secs == 0)
-    return "empty transmit timestamp";
-
-  /* NTP era 0 ends in 2036; values below the 1970 offset mean era 1. */
-  int64_t unix_s = (secs >= NTP_UNIX_DELTA)
-                       ? (int64_t)secs - (int64_t)NTP_UNIX_DELTA
-                       : (int64_t)secs + (1LL << 32) - (int64_t)NTP_UNIX_DELTA;
-  int64_t us = (int64_t)(((uint64_t)frac * 1000000ULL) >> 32);
-
-  /* Compensate for network delay: assume symmetric path. */
-  int64_t rtt = usec_of(&t4) - usec_of(&t1);
-  us += rtt / 2;
-  unix_s += us / 1000000;
-  us %= 1000000;
-
-  if (unix_s < MIN_SANE_UNIX)
-    return "implausible time from server";
-
-  out->tv_sec = (time_t)unix_s;
-  out->tv_usec = (suseconds_t)us;
-  *rtt_us = rtt;
-  return NULL;
+  return *good ? NULL : err;
 }
 #endif
 
@@ -599,8 +648,8 @@ int main(void) {
 }
 #else
 /* Try each configured server once. Returns the one that answered. */
-static const char *try_servers(char *list, size_t len, struct timeval *set,
-                               int64_t *rtt, const char **err) {
+static const char *try_servers(char *list, size_t len, int64_t *offset,
+                               int64_t *delay, int *good, const char **err) {
   char *tok, *save = NULL;
   int tried = 0;
 
@@ -612,7 +661,7 @@ static const char *try_servers(char *list, size_t len, struct timeval *set,
     if (!*server) continue;
     tried++;
     logmsg("querying %s", server);
-    if (!(*err = sntp_query(server, set, rtt)))
+    if (!(*err = sntp_query(server, offset, delay, good)))
       return server;
     logmsg("%s: %s", server, *err);
   }
@@ -863,8 +912,8 @@ static int sync_main(void) {
   char list[sizeof(cfg.servers)], suffix[160];
   struct timeval set;
   const char *err, *used;
-  int64_t rtt = 0;
-  int waited = 0;
+  int64_t offset = 0, delay = 0, now_us;
+  int good = 0, waited = 0;
 
   log_open();
   load_config();
@@ -872,7 +921,8 @@ static int sync_main(void) {
 
   /* The clock may have just been moved by time-unsync, so measure the
    * retry window with sleep() counts rather than wall-clock time. */
-  while (!(used = try_servers(list, sizeof(list), &set, &rtt, &err)) &&
+  while (!(used = try_servers(list, sizeof(list), &offset, &delay, &good,
+                              &err)) &&
          waited + RETRY_PAUSE_SEC <= cfg.retry_for) {
     logmsg("retrying in %ds", RETRY_PAUSE_SEC);
     sleep(RETRY_PAUSE_SEC);
@@ -883,12 +933,23 @@ static int sync_main(void) {
     fail("FAILED: %s (edit " CONF_PATH ")", err);
     return 1;
   }
+
+  /* Apply the offset to the clock as it is right now, so time spent since
+   * the measurement doesn't count as error. */
+  gettimeofday(&set, NULL);
+  now_us = usec_of(&set) + offset;
+  set.tv_sec = (time_t)(now_us / 1000000);
+  set.tv_usec = (suseconds_t)(now_us % 1000000);
   if (set_clock(&set) != 0) {
     fail("FAILED: kernel refused to set the clock (privileges?)");
     return 1;
   }
-  snprintf(suffix, sizeof(suffix), " via %s (rtt %lld ms)", used,
-           (long long)(rtt / 1000));
+  logmsg("corrected by %+lld.%03lld ms (best of %d samples, delay %lld ms, "
+         "accurate to about +-%lld ms)",
+         (long long)(offset / 1000), (long long)llabs(offset % 1000), good,
+         (long long)(delay / 1000), (long long)(delay / 2000));
+  snprintf(suffix, sizeof(suffix), " via %s (+-%lld ms)", used,
+           (long long)(delay / 2000));
   report_clock(suffix);
   unlink(UNSYNCED_PATH);
 
